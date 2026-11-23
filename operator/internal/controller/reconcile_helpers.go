@@ -116,12 +116,21 @@ func (r *LMCacheEngineReconciler) validateAndSetCondition(ctx context.Context, e
 	return nil
 }
 
-// reconcileDaemonSet creates or updates the DaemonSet.
+// reconcileDaemonSet creates or updates the DaemonSet, preserving the existing
+// selector's labels in the pod template on updates.
 func (r *LMCacheEngineReconciler) reconcileDaemonSet(ctx context.Context, engine *lmcachev1alpha1.LMCacheEngine) error {
+	// Resolve the coordinator connection (ref -> Service URL) so the DaemonSet
+	// builder emits --coordinator-url for server registration.
+	conn, err := resources.ResolveCoordinatorConnection(ctx, r.Client, engine.Namespace, engine.Spec.Coordinator)
+	if err != nil {
+		return err
+	}
+	engine.Spec.Coordinator = conn
+
 	desired := resources.BuildDaemonSet(engine)
 
 	existing := &appsv1.DaemonSet{}
-	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
+	err = r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			if err := ctrl.SetControllerReference(engine, desired, r.Scheme); err != nil {
@@ -135,8 +144,8 @@ func (r *LMCacheEngineReconciler) reconcileDaemonSet(ctx context.Context, engine
 	// Preserve immutable selector
 	desired.Spec.Selector = existing.Spec.Selector
 	desired.Spec.Template.Labels = resources.MergeLabels(
-		existing.Spec.Selector.MatchLabels,
 		desired.Spec.Template.Labels,
+		existing.Spec.Selector.MatchLabels,
 	)
 
 	if err := ctrl.SetControllerReference(engine, desired, r.Scheme); err != nil {

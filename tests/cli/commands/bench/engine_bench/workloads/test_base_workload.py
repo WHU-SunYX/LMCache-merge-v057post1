@@ -2,10 +2,11 @@
 """Tests for the BaseWorkload abstract class."""
 
 # Standard
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 import queue
 
 # First Party
+from lmcache.cli.commands.bench.engine_bench.config import WarmupPolicy
 from lmcache.cli.commands.bench.engine_bench.stats import RequestResult
 from lmcache.cli.commands.bench.engine_bench.workloads.base import BaseWorkload
 
@@ -46,6 +47,7 @@ def _make_mock_result(request_id: str = "req_0") -> RequestResult:
 
 def _make_stub(**kwargs) -> StubWorkload:
     sender = MagicMock()
+    sender.close = AsyncMock()
     collector = MagicMock()
     monitor = MagicMock()
     return StubWorkload(sender, collector, monitor, **kwargs)
@@ -137,6 +139,7 @@ class TestBaseWorkloadRunLoop:
                 self.request_finished(_make_mock_result("warmup_0"), "warmup_text")
 
         sender = MagicMock()
+        sender.close = AsyncMock()
         collector = MagicMock()
         monitor = MagicMock()
         w = WarmupEnqueuer(sender, collector, monitor)
@@ -149,3 +152,31 @@ class TestBaseWorkloadRunLoop:
         # Default: step returns -1.0
         w.run()
         assert len(w.step_calls) == 1
+
+
+class TestBaseWorkloadWarmupPolicy:
+    def test_run_policy_calls_warmup(self) -> None:
+        w = _make_stub()
+        w.run(WarmupPolicy.RUN)
+        assert w.warmup_called is True
+
+    def test_skip_policy_does_not_call_warmup(self) -> None:
+        w = _make_stub()
+        w.run(WarmupPolicy.SKIP)
+        assert w.warmup_called is False
+
+    def test_skip_policy_still_runs_benchmark(self) -> None:
+        w = _make_stub()
+        w._step_returns = [0.0, -1.0]
+        w.run(WarmupPolicy.SKIP)
+        assert len(w.step_calls) == 2
+        w._stats_collector.reset.assert_called_once()  # type: ignore[attr-defined]
+
+    def test_skip_policy_logs_skipped_warmup(self) -> None:
+        sender = MagicMock()
+        sender.close = AsyncMock()
+        monitor = MagicMock()
+        w = StubWorkload(sender, MagicMock(), monitor)
+        w.run(WarmupPolicy.SKIP)
+        messages = [call.args[0] for call in monitor.log_message.call_args_list]
+        assert "Skipping warmup phase, starting benchmark" in messages

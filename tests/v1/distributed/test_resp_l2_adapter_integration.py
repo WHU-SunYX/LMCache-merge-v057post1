@@ -16,13 +16,23 @@ import pytest
 import torch
 
 # First Party
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import (
+    MemoryLayoutDesc,
+    MemoryResidency,
+    MemorySegment,
+    MemoryTags,
+    ObjectKey,
+)
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObjMetadata,
     TensorMemoryObj,
 )
 from lmcache.v1.platform import consume_fd
+
+_MEMORY_TAGS = MemoryTags(MemorySegment.STORAGE, MemoryResidency.REMOTE)
+
+_EMPTY_LAYOUT = MemoryLayoutDesc(shapes=[], dtypes=[])
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6399"))
@@ -123,7 +133,7 @@ class TestRESPL2AdapterIntegration:
         )
 
         native_client = LMCacheRedisClient(REDIS_HOST, REDIS_PORT, 4)
-        self.adapter = NativeConnectorL2Adapter(native_client)
+        self.adapter = NativeConnectorL2Adapter(native_client, _MEMORY_TAGS)
         yield
         self.adapter.close()
         flush_redis()
@@ -151,7 +161,7 @@ class TestRESPL2AdapterIntegration:
         assert completed[store_tid].is_successful()
 
         # Lookup all — should find everything
-        lookup_tid = self.adapter.submit_lookup_and_lock_task(keys)
+        lookup_tid = self.adapter.submit_lookup_and_lock_task(keys, {0: _EMPTY_LAYOUT})
         assert wait_for_event_fd(lookup_fd)
         bitmap = self.adapter.query_lookup_and_lock_result(lookup_tid)
         assert bitmap is not None
@@ -166,7 +176,7 @@ class TestRESPL2AdapterIntegration:
         keys = [create_object_key(i + 1000) for i in range(3)]
         lookup_fd = self.adapter.get_lookup_and_lock_event_fd()
 
-        lookup_tid = self.adapter.submit_lookup_and_lock_task(keys)
+        lookup_tid = self.adapter.submit_lookup_and_lock_task(keys, {0: _EMPTY_LAYOUT})
         assert wait_for_event_fd(lookup_fd)
         bitmap = self.adapter.query_lookup_and_lock_result(lookup_tid)
         assert bitmap is not None
@@ -189,7 +199,7 @@ class TestRESPL2AdapterIntegration:
         assert self.adapter.pop_completed_store_tasks()[store_tid].is_successful()
 
         # Lookup
-        lookup_tid = self.adapter.submit_lookup_and_lock_task([key])
+        lookup_tid = self.adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
         assert wait_for_event_fd(lookup_fd)
         bitmap = self.adapter.query_lookup_and_lock_result(lookup_tid)
         assert bitmap.test(0) is True
@@ -227,7 +237,7 @@ class TestRESPL2AdapterIntegration:
         assert self.adapter.pop_completed_store_tasks()[store_tid].is_successful()
 
         # Lookup all
-        lookup_tid = self.adapter.submit_lookup_and_lock_task(keys)
+        lookup_tid = self.adapter.submit_lookup_and_lock_task(keys, {0: _EMPTY_LAYOUT})
         assert wait_for_event_fd(lookup_fd)
         bitmap = self.adapter.query_lookup_and_lock_result(lookup_tid)
         for i in range(n):
@@ -260,7 +270,9 @@ class TestRESPL2AdapterIntegration:
 
         # Lookup 5 keys (3 stored + 2 missing)
         all_keys = stored_keys + [create_object_key(100), create_object_key(101)]
-        lookup_tid = self.adapter.submit_lookup_and_lock_task(all_keys)
+        lookup_tid = self.adapter.submit_lookup_and_lock_task(
+            all_keys, {0: _EMPTY_LAYOUT}
+        )
         assert wait_for_event_fd(lookup_fd)
         bitmap = self.adapter.query_lookup_and_lock_result(lookup_tid)
 

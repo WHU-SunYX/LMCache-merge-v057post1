@@ -6,7 +6,6 @@
 #   Wenwen Chen <wenwen.chen@samsung.com>
 
 # Standard
-from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 from typing import Optional
@@ -14,10 +13,6 @@ from unittest.mock import patch
 import asyncio
 import importlib.util
 import os
-import random
-import shlex
-import socket
-import subprocess
 import time
 
 # Third Party
@@ -26,15 +21,27 @@ import pytest
 import torch
 
 # First Party
-from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
-from lmcache.v1.memory_management import MixedMemoryAllocator
-from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.inprocess.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
+from lmcache.inprocess.v1.metadata import LMCacheMetadata
+from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
 
 if importlib.util.find_spec("pytest_benchmark") is None:
 
     @pytest.fixture
     def benchmark():
         pytest.skip("pytest-benchmark is not installed")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def disable_usage_tracking():
+    """Keep the test suite from sending usage telemetry to the stats server.
+
+    Tests that exercise the telemetry itself (tests/test_usage_context.py)
+    re-enable it per-test via monkeypatch with an injected transport.
+    """
+    os.environ["LMCACHE_TRACK_USAGE"] = "false"
+    yield
+
 
 # This is to mock the constructor and destructor of
 # MixedMemoryAllocator and PinMemoryAllocator to
@@ -84,17 +91,18 @@ def patch_mixed_allocator():
 
     def fake_mixed_close(self):
         if not self._unregistered:
-            torch.cuda.synchronize()
+            torch_dev.synchronize()
             # torch.cuda.cudart().cudaHostUnregister(self.buffer.data_ptr())
             self._unregistered = True
 
     with (
         patch(
-            "lmcache.v1.memory_management.MixedMemoryAllocator.__init__",
+            "lmcache.v1.memory_allocators.mixed_memory_allocator.MixedMemoryAllocator.__init__",
             fake_mixed_init,
         ),
         patch(
-            "lmcache.v1.memory_management.MixedMemoryAllocator.close", fake_mixed_close
+            "lmcache.v1.memory_allocators.mixed_memory_allocator.MixedMemoryAllocator.close",
+            fake_mixed_close,
         ),
     ):
         yield
@@ -134,15 +142,19 @@ def patch_pin_allocator():
 
     def fake_pin_close(self):
         if not self._unregistered:
-            torch.cuda.synchronize()
+            torch_dev.synchronize()
             # torch.cuda.cudart().cudaHostUnregister(self.buffer.data_ptr())
             self._unregistered = True
 
     with (
         patch(
-            "lmcache.v1.memory_management.PinMemoryAllocator.__init__", fake_pin_init
+            "lmcache.v1.memory_allocators.pin_memory_allocator.PinMemoryAllocator.__init__",
+            fake_pin_init,
         ),
-        patch("lmcache.v1.memory_management.PinMemoryAllocator.close", fake_pin_close),
+        patch(
+            "lmcache.v1.memory_allocators.pin_memory_allocator.PinMemoryAllocator.close",
+            fake_pin_close,
+        ),
     ):
         yield
 """
@@ -152,19 +164,41 @@ class MockSyncGlideClient:
     """In-memory mock of a synchronous Glide (Valkey) client."""
 
     _store: dict[bytes, bytes] = {}
+    #: Records the ``expiry`` argument from the most recent ``set`` call so
+    #: tests can assert TTL behavior. ``None`` means no expiry was passed.
+    last_expiry = None
 
-    def set(self, key: bytes, value) -> None:
+    def set(self, key: bytes, value, expiry=None) -> None:
         self._store[key] = bytes(value)
+        type(self).last_expiry = expiry
 
-    def get(self, key: bytes):
-        return self._store.get(key)
+    def get(self, key: bytes, buffer=None):
+        data = self._store.get(key)
+        if buffer is None:
+            return data
+        # Mirror glide's native buffer-GET: write into the caller's buffer and
+        # return the number of bytes read (an int count), or None on miss.
+        if data is None:
+            return None
+        n = len(data)
+        buffer[:n] = data
+        return n
 
     def exists(self, keys: list[bytes]) -> int:
         return sum(1 for k in keys if k in self._store)
 
+    def delete(self, keys: list[bytes]) -> int:
+        removed = 0
+        for k in keys:
+            if k in self._store:
+                del self._store[k]
+                removed += 1
+        return removed
+
     @classmethod
     def reset_store(cls) -> None:
         cls._store.clear()
+        cls.last_expiry = None
 
 
 class MockRedis:
@@ -559,12 +593,6 @@ class MockHf3fsFuse:
         pass
 
 
-@dataclass
-class LMCacheServerProcess:
-    server_url: str
-    server_process: object
-
-
 @pytest.fixture(scope="function", autouse=True)
 def mock_redis():
     with (
@@ -630,71 +658,10 @@ def mock_hf3fs():
     sys.modules.pop("hf3fs_fuse.io", None)
 
 
-@pytest.fixture(scope="module")
-def lmserver_v1_process(request):
-    def ensure_connection(host, port):
-        retries = 10
-        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        successful = False
-        while retries > 0:
-            retries -= 1
-            try:
-                print("Probing connection, remaining retries: ", retries)
-                client_socket.connect((host, port))
-                successful = True
-                break
-            except ConnectionRefusedError:
-                time.sleep(1)
-                print("Connection refused!")
-                continue
-            except Exception as e:
-                print(f"other Exception: {e}")
-                continue
-
-        client_socket.close()
-        return successful
-
-    # Specify remote device
-    device = request.param
-
-    # Start the process
-    max_retries = 5
-    while max_retries > 0:
-        max_retries -= 1
-        port_number = random.randint(10000, 65500)
-        print("Starting the lmcache v1 server process on port")
-        proc = subprocess.Popen(
-            shlex.split(
-                f"python3 -m lmcache.v1.server localhost {port_number} {device}"
-            )
-        )
-
-        # Wait for lmcache process to start
-        time.sleep(5)
-
-        successful = False
-        if proc.poll() is not None:
-            successful = True
-        else:
-            successful = ensure_connection("localhost", port_number)
-
-        if not successful:
-            proc.terminate()
-            proc.wait()
-        else:
-            break
-
-    # Yield control back to the test until it finishes
-    server_url = f"lm://localhost:{port_number}"
-    yield LMCacheServerProcess(server_url, proc)
-
-    # Terminate the process
-    proc.terminate()
-    proc.wait()
-
-    # Destroy remote disk path
-    if device not in ["cpu"]:
-        subprocess.run(shlex.split(f"rm -rf {device}"))
+@pytest.fixture
+def remote_storage_url(tmp_path: Path) -> str:
+    """Return an isolated filesystem-backed remote storage URL."""
+    return f"fs://localhost:0/{tmp_path}"
 
 
 @pytest.fixture(scope="function")
@@ -767,12 +734,16 @@ def memory_allocator():
 
 
 @pytest.fixture(autouse=True)  # function-scoped by default
-def use_shared_allocator(request, monkeypatch, memory_allocator):
+def use_shared_allocator(request, monkeypatch):
     """Default: patch. Opt out with @pytest.mark.no_shared_allocator."""
     if request.node.get_closest_marker("no_shared_allocator"):
         # do NOT patch for this test
         yield
         return
+
+    # Resolve lazily (after the marker check) so the 5GB session allocator
+    # is only constructed when a test actually uses the shared allocator.
+    memory_allocator = request.getfixturevalue("memory_allocator")
 
     def _create_shared_allocator(config, metadata, numa_mapping):
         return memory_allocator
@@ -799,3 +770,90 @@ def lmcache_engine_metadata(role="worker"):
         use_mla=False,
         role=role,
     )
+
+
+@pytest.fixture(scope="session")
+def bigtable_emulator():
+    """Start or connect to the Bigtable emulator for integration testing."""
+    # Standard
+    import os
+    import shutil
+    import subprocess
+
+    existing_host = os.environ.get("BIGTABLE_EMULATOR_HOST")
+    if existing_host:
+        print(f"\n[Fixture] Reusing existing Bigtable emulator at {existing_host}...")
+        yield existing_host
+        return
+
+    if os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true":
+        pytest.skip("Skipping Bigtable emulator integration tests in CI")
+
+    if not shutil.which("gcloud"):
+        pytest.skip(
+            "gcloud CLI not found, skipping Bigtable Emulator integration tests"
+        )
+
+    port = "8899"
+    host_port = f"localhost:{port}"
+
+    print(f"\n[Fixture] Starting Bigtable emulator on {host_port}...")
+    emulator_process = subprocess.Popen(
+        [
+            "gcloud",
+            "beta",
+            "emulators",
+            "bigtable",
+            "start",
+            f"--host-port={host_port}",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    os.environ["BIGTABLE_EMULATOR_HOST"] = host_port
+
+    def is_port_open(h: str, p: int, t: float = 1.0) -> bool:
+        # Standard
+        import socket
+
+        try:
+            with socket.create_connection((h, p), timeout=t):
+                return True
+        except OSError:
+            return False
+
+    # Wait for the emulator to initialize
+    port_num = int(port)
+    start_time = time.time()
+    success = False
+    while time.time() - start_time < 10.0:
+        if is_port_open("localhost", port_num):
+            success = True
+            break
+        time.sleep(0.5)
+
+    if not success:
+        print(
+            f"\n[Fixture] Bigtable emulator failed to bind to {host_port} within 10s!"
+        )
+        try:
+            stdout, stderr = emulator_process.communicate(timeout=2.0)
+            print(f"Stdout:\n{stdout.decode('utf-8', errors='ignore')}")
+            print(f"Stderr:\n{stderr.decode('utf-8', errors='ignore')}")
+        except Exception as e:
+            print(f"Could not retrieve process logs: {e}")
+        emulator_process.kill()
+        pytest.fail("Failed to start Bigtable emulator")
+
+    yield host_port
+
+    print("\n[Fixture] Stopping Bigtable emulator...")
+    emulator_process.terminate()
+    try:
+        emulator_process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        emulator_process.kill()
+
+    if "BIGTABLE_EMULATOR_HOST" in os.environ:
+        del os.environ["BIGTABLE_EMULATOR_HOST"]

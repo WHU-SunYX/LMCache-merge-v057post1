@@ -18,12 +18,17 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import TYPE_CHECKING, Optional
 from urllib.parse import quote as url_quote
+from urllib.parse import urlencode
 import asyncio
 import ctypes
 import threading
+import xml.etree.ElementTree as ET
 
 if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.distributed.api import MemoryLayoutDesc
     from lmcache.v1.distributed.internal_api import L1MemoryDesc
+    from lmcache.v1.memory_management import MemoryObj
 
 # Third Party
 from awscrt import auth, io, s3
@@ -31,10 +36,18 @@ from awscrt.http import HttpHeaders, HttpRequest
 from awscrt.io import ClientTlsContext, TlsConnectionOptions, TlsContextOptions
 
 # First Party
+from lmcache.lmcache_native import Bitmap
 from lmcache.logging import init_logger
-from lmcache.native_storage_ops import Bitmap
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import (
+    KeyEntry,
+    KeyListPage,
+    MemoryResidency,
+    MemorySegment,
+    MemoryTags,
+    ObjectKey,
+)
 from lmcache.v1.distributed.internal_api import L2StoreResult
+from lmcache.v1.distributed.key_codec import decode_storage_key, encode_storage_key
 from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
     L2TaskId,
@@ -46,7 +59,6 @@ from lmcache.v1.distributed.l2_adapters.config import (
 from lmcache.v1.distributed.l2_adapters.factory import (
     register_l2_adapter_factory,
 )
-from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.platform import create_event_notifier
 
 logger = init_logger(__name__)
@@ -57,33 +69,72 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _object_key_to_string(key: ObjectKey) -> str:
-    """Serialize an ObjectKey to a deterministic S3 object name.
+def _string_to_object_key(name: str) -> ObjectKey:
+    """Recover an ObjectKey from its L2 storage name."""
+    return decode_storage_key(name)
 
-    Unsalted::
 
-        <model_name>@<kv_rank_hex>@<chunk_hash_hex>
+def _parse_list_response_xml(
+    body: bytes,
+) -> tuple[list[tuple[ObjectKey, int]], Optional[str]]:
+    """Parse a ListObjectsV2 XML response into ``(entries, next_token)``.
 
-    Salted (trailing ``cache_salt``)::
+    Entries this adapter can't parse (foreign objects in the bucket)
+    are skipped silently. ``next_token`` is ``None`` when the listing
+    is not truncated.
 
-        <model_name>@<kv_rank_hex>@<chunk_hash_hex>@<cache_salt>
-
-    Keys with ``cache_salt=""`` produce the 3-field shape (bit-identical
-    to the pre-``cache_salt`` format), so existing un-salted caches
-    remain valid with no migration. ``@`` in ``model_name`` and
-    ``cache_salt`` is rejected by ``ObjectKey.__post_init__``, so the
-    format is unambiguous.
+    Raises:
+        ValueError: the response body is not valid XML.
     """
-    base = f"{key.model_name}@{key.kv_rank:08x}@{key.chunk_hash.hex()}"
-    if key.cache_salt:
-        return f"{base}@{key.cache_salt}"
-    return base
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError as exc:
+        raise ValueError(f"malformed ListObjectsV2 XML: {exc}") from None
+
+    # Strip the default XML namespace so ``findall("Contents")`` works.
+    # The tree is local to this function — do not cache or return it.
+    for elem in root.iter():
+        if "}" in elem.tag:
+            elem.tag = elem.tag.split("}", 1)[1]
+
+    entries: list[tuple[ObjectKey, int]] = []
+    for contents in root.findall("Contents"):
+        key_elem = contents.find("Key")
+        size_elem = contents.find("Size")
+        if key_elem is None or key_elem.text is None:
+            continue
+        try:
+            obj_key = _string_to_object_key(key_elem.text)
+        except ValueError as exc:
+            logger.debug(
+                "Skipping unparsable S3 object %r in listing: %s", key_elem.text, exc
+            )
+            continue
+        size = 0
+        if size_elem is not None and size_elem.text is not None:
+            try:
+                size = int(size_elem.text)
+            except ValueError:
+                pass
+        entries.append((obj_key, size))
+
+    next_token_elem = root.find("NextContinuationToken")
+    next_token = (
+        next_token_elem.text
+        if next_token_elem is not None and next_token_elem.text
+        else None
+    )
+    return entries, next_token
+
+
+def _object_key_to_string(key: ObjectKey) -> str:
+    """Return the shared L2 storage key."""
+    return encode_storage_key(key)
 
 
 def _format_safe_path(key_str: str) -> str:
-    """Flatten slashes and URL-encode to form a safe HTTP path."""
-    flat = key_str.replace("/", "_")
-    return "/" + url_quote(flat)
+    """URL-encode the object name to form a safe HTTP path."""
+    return "/" + url_quote(key_str)
 
 
 def _make_credentials_provider(
@@ -331,6 +382,12 @@ class S3L2Adapter(L2AdapterInterface):
     connection-class errors, ``connection_disabled`` is set; all
     subsequent submits short-circuit and record failure without
     touching S3.
+
+    Load sizes: a key counts as loaded only when the object delivered
+    exactly ``obj.get_size()`` bytes. A GET body that would run past the
+    destination is refused before the copy, and a shorter object is a
+    miss, as in the valkey and fs adapters. The object on S3 is left
+    alone; the adapter only forgets its cached size for that key.
     """
 
     max_connection_failures = 3
@@ -488,7 +545,9 @@ class S3L2Adapter(L2AdapterInterface):
     # Lookup and Lock Interface
     # ------------------------------------------------------------------
 
-    def submit_lookup_and_lock_task(self, keys: list[ObjectKey]) -> L2TaskId:
+    def submit_lookup_and_lock_task(
+        self, keys: list[ObjectKey], group_layout_descs: dict[int, MemoryLayoutDesc]
+    ) -> L2TaskId:
         with self._lock:
             task_id = self._next_task_id
             self._next_task_id += 1
@@ -591,6 +650,62 @@ class S3L2Adapter(L2AdapterInterface):
     # ``max_capacity_gb`` was 0 (unlimited / no eviction signal).
 
     # ------------------------------------------------------------------
+    # Listing
+    # ------------------------------------------------------------------
+
+    def list_l2_keys(
+        self,
+        model_name: Optional[str] = None,
+        page_size: int = 500,
+        cursor: Optional[str] = None,
+    ) -> KeyListPage:
+        """List keys from the S3 bucket via ``ListObjectsV2``.
+
+        Args:
+            model_name: if set, restrict listing to objects whose name
+                starts with ``<model_name>@``.
+            page_size: target entries per page. Clamped to S3's
+                ``MaxKeys=1000`` ceiling.
+            cursor: opaque continuation token from the previous page.
+
+        Raises:
+            ValueError: ``page_size`` non-positive, malformed
+                ``cursor``, or malformed S3 response.
+            RuntimeError: connection is circuit-broken, or the
+                underlying CRT request errored out.
+        """
+        if page_size <= 0:
+            raise ValueError(f"page_size must be positive (got {page_size})")
+        # ListObjectsV2's ``MaxKeys`` is capped at 1000 by S3. The
+        # adapter clamps so callers asking for more just get the S3
+        # max plus a continuation token — they don't need to know
+        # about the server-side limit.
+        max_keys = min(page_size, 1000)
+        # ``model_name`` rides along as a ``prefix=`` query param so S3
+        # skips non-matching keys server-side. Keys are stored under
+        # their literal name (no path-flattening), so the prefix is
+        # just ``<model_name>@``.
+        prefix: Optional[str] = None
+        if model_name is not None:
+            prefix = f"{model_name}@"
+
+        with self._lock:
+            if self._connection_disabled:
+                raise RuntimeError(
+                    "S3 connection disabled (circuit-broken); listing unavailable"
+                )
+
+        fut = asyncio.run_coroutine_threadsafe(
+            self._execute_list(prefix, max_keys, cursor),
+            self._loop,
+        )
+        entries, next_token = fut.result(timeout=30.0)
+        page_entries = tuple(
+            KeyEntry(key=k.to_encoded_object_key(), size_bytes=sz) for k, sz in entries
+        )
+        return KeyListPage(entries=page_entries, next_page_token=next_token)
+
+    # ------------------------------------------------------------------
     # Status / Cleanup
     # ------------------------------------------------------------------
 
@@ -609,6 +724,10 @@ class S3L2Adapter(L2AdapterInterface):
             "current_size_bytes": usage.total_bytes_used,
             "max_capacity_bytes": usage.total_capacity_bytes,
         }
+
+    def get_memory_tags(self) -> MemoryTags:
+        """Return the memory tags of this adapter: remote storage."""
+        return MemoryTags(MemorySegment.STORAGE, MemoryResidency.REMOTE)
 
     def close(self) -> None:
         if self._closed:
@@ -705,10 +824,30 @@ class S3L2Adapter(L2AdapterInterface):
     def _get_request(self, key_str: str, mem_obj: MemoryObj):
         req = self._make_request("GET", key_str)
         data_ptr = mem_obj.data_ptr
+        capacity = mem_obj.get_size()
+        # Bytes copied into ``mem_obj`` so far. ``_execute_load`` compares
+        # the total with the destination size once the transfer is over.
+        # The comparison cannot live in ``on_done``: the CRT completes
+        # ``finished_future`` (which ``_execute_load`` awaits) before it
+        # invokes ``on_done``, so an error raised there arrives too late
+        # to change the load result.
+        progress = {"received": 0}
 
         def on_body(chunk, offset, **kwargs):
+            n = len(chunk)
+            if offset < 0 or offset + n > capacity:
+                # Never write outside the caller's buffer. Raising here
+                # makes the CRT abort the transfer and surface the error
+                # through ``finished_future``, so the key is reported as
+                # a miss and nothing past ``capacity`` is touched.
+                raise RuntimeError(
+                    f"S3 GET for {key_str} returned bytes outside the "
+                    f"destination buffer: offset={offset} len={n} "
+                    f"capacity={capacity}"
+                )
             # Write chunk into the caller-provided MemoryObj buffer.
-            ctypes.memmove(data_ptr + offset, chunk, len(chunk))
+            ctypes.memmove(data_ptr + offset, chunk, n)
+            progress["received"] += n
 
         def on_done(error=None, status_code=None, **kwargs):
             ok = (status_code in (200, 206)) or (status_code is None and error is None)
@@ -726,7 +865,7 @@ class S3L2Adapter(L2AdapterInterface):
             credential_provider=self._credentials_provider,
             region=self._region,
         )
-        return s3_req
+        return s3_req, progress
 
     def _put_request(self, key_str: str, mem_obj: MemoryObj):
         stream = MemoryViewStream(mem_obj.byte_array)
@@ -785,6 +924,63 @@ class S3L2Adapter(L2AdapterInterface):
             region=self._region,
         )
         return s3_req
+
+    def _list_request(
+        self,
+        prefix: Optional[str],
+        max_keys: int,
+        continuation_token: Optional[str],
+    ):
+        """Build a ListObjectsV2 request.
+
+        Returns ``(s3_req, body_chunks, captured)``. The caller awaits
+        ``s3_req.finished_future`` and assembles the XML from
+        ``body_chunks``.
+        """
+        params: list[tuple[str, str]] = [
+            ("list-type", "2"),
+            ("max-keys", str(max_keys)),
+        ]
+        if prefix:
+            params.append(("prefix", prefix))
+        if continuation_token:
+            params.append(("continuation-token", continuation_token))
+        # urlencode handles percent-escaping of values (continuation
+        # tokens are typically base64 with ``+``/``/``/``=`` chars).
+        path = "/?" + urlencode(params, quote_via=url_quote)
+
+        headers = HttpHeaders()
+        headers.add("Host", self._endpoint)
+        req = HttpRequest("GET", path, headers)
+
+        body_chunks: list[bytes] = []
+        captured: dict[str, Optional[int]] = {"status": None}
+
+        def on_body(chunk, offset, **kwargs):
+            body_chunks.append(bytes(chunk))
+
+        def on_headers(status_code, headers, **kwargs):
+            captured["status"] = status_code
+
+        def on_done(error=None, status_code=None, **kwargs):
+            captured["status"] = status_code or captured["status"]
+            if error or captured["status"] != 200:
+                raise RuntimeError(
+                    f"S3 ListObjectsV2 failed: {error or captured['status']}"
+                )
+
+        s3_req = s3.S3Request(
+            client=self._s3_client,
+            type=s3.S3RequestType.DEFAULT,
+            request=req,
+            operation_name="ListObjectsV2",
+            on_body=on_body,
+            on_headers=on_headers,
+            on_done=on_done,
+            credential_provider=self._credentials_provider,
+            region=self._region,
+        )
+        return s3_req, body_chunks, captured
 
     def _record_connection_outcome(self, error_msg: Optional[str]) -> None:
         """Update the circuit breaker under the lock."""
@@ -974,14 +1170,34 @@ class S3L2Adapter(L2AdapterInterface):
     ) -> None:
         bitmap = Bitmap(len(keys))
         futures = []
-        launched_indices = []
+        # (index, key string, expected byte count, GET progress) per GET.
+        launched: list[tuple[int, str, int, dict]] = []
 
         for i, (key, obj) in enumerate(zip(keys, objects, strict=True)):
             try:
                 key_str = _object_key_to_string(key)
-                s3_req = self._get_request(key_str, obj)
+                expected = obj.get_size()
+                with self._lock:
+                    cached_size = self._object_size_cache.get(key_str)
+                if cached_size is not None and cached_size != expected:
+                    # The object on S3 is not the size this load expects:
+                    # written under another layout or serde, or truncated.
+                    # Reading it would fill the destination with the wrong
+                    # bytes, so report a miss and forget the cached size so
+                    # that a later lookup asks S3 again.
+                    logger.warning(
+                        "S3L2Adapter: object %s is %d bytes on S3 but the "
+                        "load expects %d; treating it as a miss",
+                        key_str,
+                        cached_size,
+                        expected,
+                    )
+                    with self._lock:
+                        self._object_size_cache.pop(key_str, None)
+                    continue
+                s3_req, progress = self._get_request(key_str, obj)
                 futures.append(asyncio.wrap_future(s3_req.finished_future))
-                launched_indices.append(i)
+                launched.append((i, key_str, expected, progress))
             except Exception:
                 logger.exception("S3L2Adapter failed to launch GET")
 
@@ -989,9 +1205,32 @@ class S3L2Adapter(L2AdapterInterface):
         last_error: Optional[str] = None
         any_success = False
 
-        for idx, result in zip(launched_indices, results, strict=True):
+        for (idx, key_str, expected, progress), result in zip(
+            launched, results, strict=True
+        ):
             if isinstance(result, Exception):
                 last_error = str(result)
+                # Whatever failed, the cached size is no longer trustworthy
+                # (the object may have grown or vanished): forget it so the
+                # next lookup asks S3 instead of launching the same GET.
+                with self._lock:
+                    self._object_size_cache.pop(key_str, None)
+                continue
+            received = progress["received"]
+            if received != expected:
+                # The transfer completed but delivered fewer bytes than the
+                # destination holds (more is rejected in ``on_body``). The
+                # buffer is only partly written, so this is a miss, as in
+                # the valkey adapter, not a hit with a stale tail.
+                logger.warning(
+                    "S3L2Adapter: GET for %s delivered %d bytes, expected %d; "
+                    "treating it as a miss",
+                    key_str,
+                    received,
+                    expected,
+                )
+                with self._lock:
+                    self._object_size_cache.pop(key_str, None)
                 continue
             bitmap.set(idx)
             any_success = True
@@ -1004,6 +1243,19 @@ class S3L2Adapter(L2AdapterInterface):
         with self._lock:
             self._completed_load_tasks[task_id] = bitmap
         self._load_efd.notify()
+
+    async def _execute_list(
+        self,
+        prefix: Optional[str],
+        max_keys: int,
+        continuation_token: Optional[str],
+    ) -> tuple[list[tuple[ObjectKey, int]], Optional[str]]:
+        """Issue one ``ListObjectsV2`` call and parse the response."""
+        s3_req, body_chunks, _captured = self._list_request(
+            prefix, max_keys, continuation_token
+        )
+        await asyncio.wrap_future(s3_req.finished_future)
+        return _parse_list_response_xml(b"".join(body_chunks))
 
     async def _execute_delete(
         self, keys: list[ObjectKey]

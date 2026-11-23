@@ -1,7 +1,9 @@
 Using Different Storage Backends
 ================================
 
-LMCache supports various storage backends to offload and share KV cache data.
+These storage backends are shared by LMCache's in-process and multiprocess
+modes. For the complete multiprocess L2 storage reference, see
+:doc:`/mp/l2_storage/index`.
 
 Supported Backends
 -------------------------
@@ -9,25 +11,11 @@ Supported Backends
 .. toctree::
    :maxdepth: 1
 
-   cpu_ram
-   custom_backend
    dax
-   eic
-   gds
+   fs
    hfbucket
-   infinistore
-   local_storage
-   maru
-   mock
-   mooncake
-   nixl
-   redis
    resp
    s3
-   sagemaker_hyperpod
-   valkey
-   weka
-   3fs
    
    
   

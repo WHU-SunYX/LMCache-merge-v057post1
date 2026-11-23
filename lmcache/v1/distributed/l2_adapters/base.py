@@ -15,13 +15,20 @@ import threading
 
 if TYPE_CHECKING:
     # First Party
-    from lmcache.native_storage_ops import Bitmap
+    from lmcache.lmcache_native import Bitmap
+    from lmcache.v1.distributed.api import (
+        KeyListPage,
+        MemoryLayoutDesc,
+        MemoryTags,
+        ObjectKey,
+    )
+    from lmcache.v1.distributed.internal_api import L2AdapterListener, L2StoreResult
+    from lmcache.v1.memory_management import MemoryObj
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import ObjectKey
-from lmcache.v1.distributed.internal_api import L2AdapterListener, L2StoreResult
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.mp_observability.event import Event, EventType
+from lmcache.v1.mp_observability.event_bus import get_event_bus
 
 logger = init_logger(__name__)
 
@@ -128,6 +135,9 @@ class L2AdapterInterface(ABC):
                 per-bucket byte counts regardless of this value.
         """
         self._listeners: list[L2AdapterListener] = []
+        self._backend_name: str = ""
+        self._shared: bool = False
+        self._event_bus = get_event_bus()
 
         # Centralized byte accounting. Subclasses pass ``sizes`` to
         # ``_notify_keys_stored`` / ``_notify_keys_deleted`` and the base
@@ -215,6 +225,10 @@ class L2AdapterInterface(ABC):
 
         Returns:
             L2TaskId: the task id of the submitted store task.
+
+        Notes:
+            Upstream modules may enrich ``ObjectKey.extra_attributes`` before
+            dispatch; L2 adapters should not mutate it.
         """
         pass
 
@@ -239,6 +253,7 @@ class L2AdapterInterface(ABC):
     def submit_lookup_and_lock_task(
         self,
         keys: list[ObjectKey],
+        group_layout_descs: dict[int, MemoryLayoutDesc],
     ) -> L2TaskId:
         """
         Submit a lookup and lock task to look up and lock a batch of objects
@@ -246,6 +261,10 @@ class L2AdapterInterface(ABC):
 
         Args:
             keys (list[ObjectKey]): the list of keys to be looked up and locked.
+            group_layout_descs (dict[int, MemoryLayoutDesc]): maps
+                object_group_id to that group's memory layout. This is an
+                advisory hint; most adapters ignore it. The P2P adapter
+                forwards it to the peer cache server.
 
         Returns:
             L2TaskId: the task id of the submitted lookup and lock task.
@@ -343,12 +362,56 @@ class L2AdapterInterface(ABC):
         pass
 
     #####################
+    # Memory Tags Interface
+    #####################
+
+    @abstractmethod
+    def get_memory_tags(self) -> MemoryTags:
+        """
+        Return the memory tags of the medium this adapter stores bytes in.
+
+        Returns:
+            MemoryTags: the adapter's segment and residency. ``REMOTE`` when
+            the bytes live off this host or in a domain shared with other
+            hosts.
+        """
+        pass
+
+    #####################
     # Listener Interface
     #####################
 
     def register_listener(self, listener: L2AdapterListener) -> None:
         """Register a listener to receive L2 adapter events."""
         self._listeners.append(listener)
+
+    def set_backend_identity(self, name: str, shared: bool = False) -> None:
+        """Set the identity used to tag this adapter's cache events.
+
+        Called by the storage manager right after construction (initial
+        and runtime-added adapters alike).
+
+        Args:
+            name: The registered adapter type name (e.g. ``"fs"``;
+                non-empty).
+            shared: Whether the adapter mounts a fleet-shared pool (see
+                ``L2AdapterConfigBase.shared``).
+
+        Raises:
+            ValueError: If ``name`` is empty.
+        """
+        if not name:
+            raise ValueError("backend name must be non-empty")
+        self._backend_name = name
+        self._shared = shared
+
+    def submit_touch(self, keys: list[ObjectKey]) -> None:
+        """Mark ``keys`` accessed for eviction without moving any bytes.
+
+        Args:
+            keys: The object keys to mark as accessed.
+        """
+        self._notify_keys_accessed(keys)
 
     def _notify_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
         """Update byte accounting and notify listeners that ``keys`` were
@@ -374,13 +437,34 @@ class L2AdapterInterface(ABC):
                     self._bytes_by_cache_salt.get(salt, 0) + d
                 )
         for listener in self._listeners:
-            listener.on_l2_keys_stored(keys)
+            listener.on_l2_keys_stored(keys, sizes)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L2_KEYS_STORED,
+                metadata={
+                    "keys": keys,
+                    "sizes": sizes,
+                    "backend": self._backend_name,
+                    "shared": self._shared,
+                },
+            )
+        )
 
     def _notify_keys_accessed(self, keys: list[ObjectKey]) -> None:
         # ``_notify_keys_accessed`` carries no byte impact — only LRU
         # bookkeeping cares about it, so no accounting is needed here.
         for listener in self._listeners:
             listener.on_l2_keys_accessed(keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L2_KEYS_ACCESSED,
+                metadata={
+                    "keys": keys,
+                    "backend": self._backend_name,
+                    "shared": self._shared,
+                },
+            )
+        )
 
     def _notify_keys_deleted(self, keys: list[ObjectKey], sizes: list[int]) -> None:
         """Update byte accounting and notify listeners that ``keys`` were
@@ -427,6 +511,16 @@ class L2AdapterInterface(ABC):
                     self._bytes_by_cache_salt[salt] = new_total
         for listener in self._listeners:
             listener.on_l2_keys_deleted(keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L2_KEYS_DELETED,
+                metadata={
+                    "keys": keys,
+                    "backend": self._backend_name,
+                    "shared": self._shared,
+                },
+            )
+        )
 
     #####################
     # Eviction Interface
@@ -467,6 +561,30 @@ class L2AdapterInterface(ABC):
             eviction should override this method.
         """
         return None
+
+    def list_l2_keys(
+        self,
+        model_name: str | None = None,
+        page_size: int = 500,
+        cursor: str | None = None,
+    ) -> KeyListPage:
+        """List keys currently resident in this adapter, paginated.
+
+        Args:
+            model_name: if set, restrict to keys with this
+                ``ObjectKey.model_name``.
+            page_size: maximum entries to return in this page.
+            cursor: opaque cursor from the previous page; ``None`` on
+                the first call.
+
+        Raises:
+            NotImplementedError: the adapter does not support listing.
+            ValueError: ``page_size`` is non-positive or ``cursor`` is
+                malformed.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement list_l2_keys"
+        )
 
     def get_usage(self) -> AdapterUsage:
         """

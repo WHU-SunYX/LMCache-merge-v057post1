@@ -1,48 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// SYCL implementation of LMCache memory kernels for Intel XPU.
-// Ported from csrc/mem_kernels.cu with Intel-XPU-specific
-// optimizations.
+// SYCL implementation of LMCache memory kernels for Intel XPU
+// (PVC / Arc / Battlemage).
 //
-// Performance-critical design choices for Intel XPU (PVC / Arc /
-// Battlemage):
+// Performance-critical design choices:
 //
-// 1. Work-group size 256 (vs CUDA's 128) -- Intel XPU EUs have deep
-//    hardware-thread scheduling; larger work-groups keep the EU ALUs
-//    fed and hide global-memory latency.
-//
-// 2. [[sycl::reqd_sub_group_size(16)]] -- locks SIMD lane width to
-//    16, which is the native width across all Intel discrete GPU
-//    families.  Avoids the compiler falling back to sub-group 32 on
-//    PVC (where it would halve occupancy for these kernels).
-//
-// 3. Compile-time template parameters for DIRECTION and USE_MLA --
-//    eliminates run-time branches inside the innermost loop,
-//    allowing the IGC (Intel Graphics Compiler) to schedule reads
-//    and writes without control-flow hazards.
-//
-// 4. Hoisted loop-invariant base offsets -- integer division and
-//    modulo (used by flash_infer's block-based indexing) are
-//    computed once before the inner loop and reused via simple
-//    base+i addressing.  This avoids re-executing expensive 32-bit
-//    division on every loop iteration and helps the IGC schedule
-//    straight-line loads/stores.
-//
-// 5. 64-bit (int64_t) bulk transfers -- packs two fp32 / four fp16 /
-//    eight int8 values into a single 64-bit move, doubling the
-//    effective bandwidth compared to element-wise copies.
-//
-// 6. Fused K+V work-groups (non-MLA multi-layer kernels) -- for
-//    formats that carry both key and value (k_or_v_size == 2), a
-//    specialised kernel processes both K and V within a single
-//    work-group.  This halves the total work-group count, avoids
-//    redundant slot-mapping reads and pointer-array lookups, and
-//    computes the (potentially expensive) block-index division only
-//    once per token+layer instead of twice.
+// 1. Work-group size 256 -- keeps Intel EU ALUs fed and hides
+//    global-memory latency.
+// 2. [[sycl::reqd_sub_group_size(16)]] -- native SIMD width on all
+//    Intel discrete GPUs; prevents IGC from falling back to width 32
+//    on PVC (which would halve occupancy).
+// 3. Compile-time template parameters (DIRECTION, USE_MLA) eliminate
+//    run-time branches in the innermost loop.
+// 4. Hoisted loop-invariant base offsets -- integer division/modulo
+//    (flash_infer block indexing) is computed once per token+layer
+//    rather than per inner-loop iteration.
+// 5. 64-bit (int64_t) bulk transfers pack two fp32 / four fp16 /
+//    eight int8 values per move.
+// 6. Fused K+V work-groups (non-MLA multi-layer kernels) -- one
+//    work-group handles both K and V, halving dispatch count and
+//    avoiding redundant slot/pointer/division work.
 
-// The SYCL standard headers (sycl/accessor.hpp) reference the deprecated
-// 'host_buffer' internally even when user code only uses USM pointers.
-// Suppress the resulting -Wdeprecated-declarations noise from these headers.
+// sycl/accessor.hpp references the deprecated 'host_buffer' internally
+// even when user code only uses USM pointers; suppress the noise.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #include <sycl/sycl.hpp>
@@ -63,19 +43,14 @@
 // ---------------------------------------------------------------------------
 // Tuning constants
 // ---------------------------------------------------------------------------
-// Sub-group (SIMD) width -- 16 is native on PVC, DG2, and BMG.
+// Native SIMD width on PVC, DG2, and BMG.
 constexpr int INTEL_SUB_GROUP_SIZE = 16;
 
-// Maximum work-group size.  256 gives best occupancy / latency-
-// hiding trade-off on Intel discrete GPUs whose EUs can schedule
-// more hardware threads than CUDA SMs (which typically use 128).
-// Must be a multiple of INTEL_SUB_GROUP_SIZE.
+// Max work-group size; must be a multiple of INTEL_SUB_GROUP_SIZE.
 constexpr int MAX_WG_SIZE = 256;
 
 // ---------------------------------------------------------------------------
-// Host-side helper: round *up* to the nearest multiple of
-// INTEL_SUB_GROUP_SIZE so the work-group is always evenly
-// divisible into sub-groups.
+// Round up so the work-group divides evenly into sub-groups.
 // ---------------------------------------------------------------------------
 inline int round_up_to_sg(int n) {
   return ((n + INTEL_SUB_GROUP_SIZE - 1) / INTEL_SUB_GROUP_SIZE) *
@@ -87,29 +62,24 @@ inline int round_up_to_sg(int n) {
 // ---------------------------------------------------------------------------
 namespace lmc {
 
-inline bool is_mla(const GPUKVFormat gpu_kv_format) {
-  return gpu_kv_format == GPUKVFormat::NL_X_NB_BS_HS ||   // vLLM MLA
-         gpu_kv_format == GPUKVFormat::NL_X_NBBS_ONE_HS;  // SGLang MLA
-}
-
-template <GPUKVFormat format>
+template <EngineKVFormat format>
 inline int64_t page_buffer_offset(const int k_or_v, const int token_idx,
                                   const int scalar_offset,
                                   const int scalars_per_token,
                                   const int page_buffer_size,
                                   const int block_size) {
   // vLLM cross layer
-  if constexpr (format == GPUKVFormat::NB_NL_TWO_BS_NH_HS) {
+  if constexpr (format == EngineKVFormat::NB_NL_TWO_BS_NH_HS) {
     return k_or_v * page_buffer_size * scalars_per_token +
            token_idx * scalars_per_token + scalar_offset;
   }
   // vLLM flash attention
-  else if constexpr (format == GPUKVFormat::NL_X_TWO_NB_BS_NH_HS) {
+  else if constexpr (format == EngineKVFormat::NL_X_TWO_NB_BS_NH_HS) {
     return k_or_v * page_buffer_size * scalars_per_token +
            token_idx * scalars_per_token + scalar_offset;
   }
   // vLLM flash infer
-  else if constexpr (format == GPUKVFormat::NL_X_NB_TWO_BS_NH_HS) {
+  else if constexpr (format == EngineKVFormat::NL_X_NB_TWO_BS_NH_HS) {
     const int block_idx = token_idx / block_size;
     const int block_offset = token_idx % block_size;
     return block_idx * 2 * block_size * scalars_per_token +
@@ -117,8 +87,8 @@ inline int64_t page_buffer_offset(const int k_or_v, const int token_idx,
            block_offset * scalars_per_token + scalar_offset;
   }
   // MLA formats: vLLM (NL_X_NB_BS_HS) and SGLang (NL_X_NBBS_ONE_HS)
-  else if constexpr (format == GPUKVFormat::NL_X_NB_BS_HS ||
-                     format == GPUKVFormat::NL_X_NBBS_ONE_HS) {
+  else if constexpr (format == EngineKVFormat::NL_X_NB_BS_HS ||
+                     format == EngineKVFormat::NL_X_NBBS_ONE_HS) {
     return token_idx * scalars_per_token + scalar_offset;
   }
 }
@@ -127,25 +97,25 @@ inline int64_t page_buffer_offset(const int k_or_v, const int token_idx,
 /// page_buffer_offset(k_or_v, slot, i, ...) == base_offset(...) + i.
 /// Hoisting this out of the inner loop avoids re-computing the
 /// integer division / modulo (flash_infer) on every iteration.
-template <GPUKVFormat format>
+template <EngineKVFormat format>
 inline int64_t page_buffer_base_offset(const int k_or_v, const int token_idx,
                                        const int scalars_per_token,
                                        const int page_buffer_size,
                                        const int block_size) {
-  if constexpr (format == GPUKVFormat::NB_NL_TWO_BS_NH_HS) {
+  if constexpr (format == EngineKVFormat::NB_NL_TWO_BS_NH_HS) {
     return k_or_v * page_buffer_size * scalars_per_token +
            token_idx * scalars_per_token;
-  } else if constexpr (format == GPUKVFormat::NL_X_TWO_NB_BS_NH_HS) {
+  } else if constexpr (format == EngineKVFormat::NL_X_TWO_NB_BS_NH_HS) {
     return k_or_v * page_buffer_size * scalars_per_token +
            token_idx * scalars_per_token;
-  } else if constexpr (format == GPUKVFormat::NL_X_NB_TWO_BS_NH_HS) {
+  } else if constexpr (format == EngineKVFormat::NL_X_NB_TWO_BS_NH_HS) {
     const int block_idx = token_idx / block_size;
     const int block_offset = token_idx % block_size;
     return block_idx * 2 * block_size * scalars_per_token +
            k_or_v * block_size * scalars_per_token +
            block_offset * scalars_per_token;
-  } else if constexpr (format == GPUKVFormat::NL_X_NB_BS_HS ||
-                       format == GPUKVFormat::NL_X_NBBS_ONE_HS) {
+  } else if constexpr (format == EngineKVFormat::NL_X_NB_BS_HS ||
+                       format == EngineKVFormat::NL_X_NBBS_ONE_HS) {
     return token_idx * scalars_per_token;
   }
 }
@@ -175,9 +145,8 @@ inline int64_t key_value_base_offset(const int k_or_v, const int layer_idx,
 
 // ---------------------------------------------------------------------------
 // Pointer helper -- returns a kernel-accessible pointer of the given type.
-// For XPU tensors the USM device pointer is returned directly.
-// For CPU tensors the host pointer is returned; it must have been allocated
-// with USM host memory (e.g. via sycl::malloc_host) to be device-accessible.
+// XPU tensors expose their USM device pointer; CPU tensors must be backed
+// by USM host memory (e.g. sycl::malloc_host) to be device-accessible.
 // ---------------------------------------------------------------------------
 template <typename T, typename TENSOR_TYPE>
 T* get_kernel_ptr(TENSOR_TYPE& tensor) {
@@ -185,7 +154,7 @@ T* get_kernel_ptr(TENSOR_TYPE& tensor) {
   if (device.is_xpu()) {
     return static_cast<T*>(tensor.data_ptr());
   } else if (device.is_cpu()) {
-    // USM host pointers are accessible from both host and device in SYCL.
+    // USM host pointers are device-accessible.
     return static_cast<T*>(tensor.data_ptr());
   } else {
     TORCH_CHECK(false,
@@ -201,20 +170,17 @@ T* get_kernel_ptr(TENSOR_TYPE& tensor) {
  * Submit the multi-layer KV transfer kernel for MLA formats
  * (k_or_v_size == 1).
  *
- * SYCL nd_range mapping (CUDA → SYCL):
- *   blockIdx.x  (token_id)  → item.get_group(2)
- *   blockIdx.y  (layer_id)  → item.get_group(1)
- *   threadIdx.x (tid)       → item.get_local_id(2)
- *   blockDim.x  (nthreads)  → item.get_local_range(2)
+ * nd_range layout: group(0)=k_or_v, group(1)=layer, group(2)=token;
+ * local_id(2)=tid, local_range(2)=num_threads.
  *
- * Optimizations over the naïve port:
+ * Optimizations:
  *   - DIRECTION is a compile-time bool (no branch in hot loop)
- *   - Loop-invariant base offsets (including integer division for
- *     flash_infer) are computed once before the inner loop
- *   - Work-group size rounded to sub-group multiple for full
- *     SIMD utilisation
+ *   - Loop-invariant base offsets (including flash_infer's integer
+ *     division) are computed once before the inner loop
+ *   - Work-group size rounded to a sub-group multiple for full SIMD
+ *     utilisation
  */
-template <typename scalar_t, bool DIRECTION, GPUKVFormat format>
+template <typename scalar_t, bool DIRECTION, EngineKVFormat format>
 void submit_multi_layer_kernel(sycl::queue& queue, scalar_t* key_value_ptr,
                                scalar_t** page_buffer_ptrs,
                                const int64_t* slot_mapping_ptr,
@@ -245,8 +211,8 @@ void submit_multi_layer_kernel(sycl::queue& queue, scalar_t* key_value_ptr,
 
         if (slot_idx < 0) return;
 
-        // Hoist loop-invariant base offsets (integer division for
-        // flash_infer happens here, once, not per loop iteration).
+        // Hoist loop-invariant base offsets (flash_infer's integer
+        // division happens here, once, not per loop iteration).
         const int64_t lmc_base = lmc::key_value_base_offset(
             k_or_v, layer_id, kv_token_id, scalars_per_token, num_tokens,
             num_layers);
@@ -266,19 +232,12 @@ void submit_multi_layer_kernel(sycl::queue& queue, scalar_t* key_value_ptr,
 /**
  * Submit a fused K+V multi-layer kernel for non-MLA formats.
  *
- * Processes both key (k_or_v=0) and value (k_or_v=1) within the
- * same work-group, halving the total number of work-groups compared
- * to `submit_multi_layer_kernel` with k_or_v_size=2.
- *
- * Benefits on Intel XPU:
- *   - Halves work-group dispatch overhead
- *   - Slot mapping and pointer array are read once per token+layer
- *     instead of twice (once for K, once for V)
- *   - Integer division/modulo (flash_infer block mapping) is
- *     computed once and reused for both K and V
- *   - Interleaved K+V memory requests help hide latency
+ * Processes both key (k_or_v=0) and value (k_or_v=1) within the same
+ * work-group, halving work-group count compared to dispatching K and
+ * V separately. Slot mapping, pointer-array lookup, and flash_infer's
+ * block-index division are each performed once and reused for both.
  */
-template <typename scalar_t, bool DIRECTION, GPUKVFormat format>
+template <typename scalar_t, bool DIRECTION, EngineKVFormat format>
 void submit_multi_layer_kernel_fused_kv(
     sycl::queue& queue, scalar_t* key_value_ptr, scalar_t** page_buffer_ptrs,
     const int64_t* slot_mapping_ptr, int scalars_per_token, int num_tokens,
@@ -287,8 +246,8 @@ void submit_multi_layer_kernel_fused_kv(
   int num_transfer_tokens = num_tokens - skip_prefix_n_tokens;
   if (num_transfer_tokens <= 0 || num_layers <= 0) return;
 
-  // Grid: (1, num_layers, num_transfer_tokens * wg_size)
-  // k_or_v dimension is gone -- both K and V handled in one work-group.
+  // Grid: (1, num_layers, num_transfer_tokens * wg_size);
+  // no k_or_v dimension — K and V share one work-group.
   sycl::range<3> global_range(
       1, static_cast<size_t>(num_layers),
       static_cast<size_t>(num_transfer_tokens) * wg_size);
@@ -308,8 +267,8 @@ void submit_multi_layer_kernel_fused_kv(
 
         if (slot_idx < 0) return;
 
-        // Base offsets for K (k_or_v=0) and V (k_or_v=1).
-        // The expensive division/modulo (flash_infer) happens once.
+        // Base offsets for K (k_or_v=0) and V (k_or_v=1); the
+        // flash_infer division/modulo runs once per token+layer.
         const int64_t lmc_base_k = lmc::key_value_base_offset(
             0, layer_id, kv_token_id, scalars_per_token, num_tokens,
             num_layers);
@@ -336,11 +295,9 @@ void submit_multi_layer_kernel_fused_kv(
 }
 
 // ---------------------------------------------------------------------------
-// Macros to dispatch multi-layer kernels with a specific GPUKVFormat
-// ---------------------------------------------------------------------------
-// For MLA formats (k_or_v_size == 1): use the original per-component kernel.
-// For non-MLA formats (k_or_v_size == 2): use the fused K+V kernel that
-// halves work-groups and avoids redundant slot/pointer/division work.
+// Macros to dispatch multi-layer kernels with a specific EngineKVFormat.
+// MLA formats (k_or_v_size==1) use the per-component kernel.
+// Non-MLA formats (k_or_v_size==2) use the fused K+V kernel.
 // ---------------------------------------------------------------------------
 #define LAUNCH_KERNEL_WITH_FORMAT(T, DIRECTION, FORMAT)                     \
   submit_multi_layer_kernel<T, DIRECTION, FORMAT>(                          \
@@ -362,7 +319,7 @@ void multi_layer_kv_transfer_templated(
     torch::Tensor& key_value, const torch::Tensor& key_value_ptrs,
     const torch::Tensor& slot_mapping, const torch::Device& paged_memory_device,
     const int page_buffer_size, const TransferDirection direction,
-    const GPUKVFormat gpu_kv_format, const int block_size,
+    const EngineKVFormat engine_kv_format, const int block_size,
     const int skip_prefix_n_tokens) {
   T* key_value_ptr = get_kernel_ptr<T, torch::Tensor>(key_value);
   T** page_buffer_ptrs =
@@ -376,7 +333,7 @@ void multi_layer_kv_transfer_templated(
   int elements_per_xword = sizeof(T) / key_value.element_size();
   int num_xwords = num_origin_elements / elements_per_xword;
 
-  int k_or_v_size = lmc::is_mla(gpu_kv_format) ? 1 : 2;
+  int k_or_v_size = ::is_mla(engine_kv_format) ? 1 : 2;
 
   // Round up to a sub-group multiple so every sub-group is full.
   int wg_size = round_up_to_sg(std::min(num_xwords, MAX_WG_SIZE));
@@ -385,68 +342,67 @@ void multi_layer_kv_transfer_templated(
   sycl::queue& queue =
       c10::xpu::getCurrentXPUStream(paged_memory_device.index()).queue();
 
-  // Non-MLA formats use the fused K+V kernel (processes both K and V
-  // in a single work-group).  MLA formats (k_or_v_size==1) use the
-  // original per-component kernel.
+  // Non-MLA formats use the fused K+V kernel; MLA formats
+  // (k_or_v_size==1) use the per-component kernel.
   if (k_or_v_size == 2) {
     if (direction == TransferDirection::H2D) {
-      switch (gpu_kv_format) {
-        case GPUKVFormat::NB_NL_TWO_BS_NH_HS:
-          LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(T, false,
-                                             GPUKVFormat::NB_NL_TWO_BS_NH_HS);
+      switch (engine_kv_format) {
+        case EngineKVFormat::NB_NL_TWO_BS_NH_HS:
+          LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(
+              T, false, EngineKVFormat::NB_NL_TWO_BS_NH_HS);
           break;
-        case GPUKVFormat::NL_X_TWO_NB_BS_NH_HS:
-          LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(T, false,
-                                             GPUKVFormat::NL_X_TWO_NB_BS_NH_HS);
+        case EngineKVFormat::NL_X_TWO_NB_BS_NH_HS:
+          LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(
+              T, false, EngineKVFormat::NL_X_TWO_NB_BS_NH_HS);
           break;
-        case GPUKVFormat::NL_X_NB_TWO_BS_NH_HS:
-          LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(T, false,
-                                             GPUKVFormat::NL_X_NB_TWO_BS_NH_HS);
+        case EngineKVFormat::NL_X_NB_TWO_BS_NH_HS:
+          LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(
+              T, false, EngineKVFormat::NL_X_NB_TWO_BS_NH_HS);
           break;
         default:
-          throw std::runtime_error("Unsupported non-MLA GPUKVFormat");
+          throw std::runtime_error("Unsupported non-MLA EngineKVFormat");
       }
     } else {
-      switch (gpu_kv_format) {
-        case GPUKVFormat::NB_NL_TWO_BS_NH_HS:
-          LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(T, true,
-                                             GPUKVFormat::NB_NL_TWO_BS_NH_HS);
+      switch (engine_kv_format) {
+        case EngineKVFormat::NB_NL_TWO_BS_NH_HS:
+          LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(
+              T, true, EngineKVFormat::NB_NL_TWO_BS_NH_HS);
           break;
-        case GPUKVFormat::NL_X_TWO_NB_BS_NH_HS:
-          LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(T, true,
-                                             GPUKVFormat::NL_X_TWO_NB_BS_NH_HS);
+        case EngineKVFormat::NL_X_TWO_NB_BS_NH_HS:
+          LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(
+              T, true, EngineKVFormat::NL_X_TWO_NB_BS_NH_HS);
           break;
-        case GPUKVFormat::NL_X_NB_TWO_BS_NH_HS:
-          LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(T, true,
-                                             GPUKVFormat::NL_X_NB_TWO_BS_NH_HS);
+        case EngineKVFormat::NL_X_NB_TWO_BS_NH_HS:
+          LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(
+              T, true, EngineKVFormat::NL_X_NB_TWO_BS_NH_HS);
           break;
         default:
-          throw std::runtime_error("Unsupported non-MLA GPUKVFormat");
+          throw std::runtime_error("Unsupported non-MLA EngineKVFormat");
       }
     }
   } else {
     // MLA path (k_or_v_size == 1)
     if (direction == TransferDirection::H2D) {
-      switch (gpu_kv_format) {
-        case GPUKVFormat::NL_X_NB_BS_HS:
-          LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_NB_BS_HS);
+      switch (engine_kv_format) {
+        case EngineKVFormat::NL_X_NB_BS_HS:
+          LAUNCH_KERNEL_WITH_FORMAT(T, false, EngineKVFormat::NL_X_NB_BS_HS);
           break;
-        case GPUKVFormat::NL_X_NBBS_ONE_HS:
-          LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_NBBS_ONE_HS);
+        case EngineKVFormat::NL_X_NBBS_ONE_HS:
+          LAUNCH_KERNEL_WITH_FORMAT(T, false, EngineKVFormat::NL_X_NBBS_ONE_HS);
           break;
         default:
-          throw std::runtime_error("Unsupported MLA GPUKVFormat");
+          throw std::runtime_error("Unsupported MLA EngineKVFormat");
       }
     } else {
-      switch (gpu_kv_format) {
-        case GPUKVFormat::NL_X_NB_BS_HS:
-          LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_NB_BS_HS);
+      switch (engine_kv_format) {
+        case EngineKVFormat::NL_X_NB_BS_HS:
+          LAUNCH_KERNEL_WITH_FORMAT(T, true, EngineKVFormat::NL_X_NB_BS_HS);
           break;
-        case GPUKVFormat::NL_X_NBBS_ONE_HS:
-          LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_NBBS_ONE_HS);
+        case EngineKVFormat::NL_X_NBBS_ONE_HS:
+          LAUNCH_KERNEL_WITH_FORMAT(T, true, EngineKVFormat::NL_X_NBBS_ONE_HS);
           break;
         default:
-          throw std::runtime_error("Unsupported MLA GPUKVFormat");
+          throw std::runtime_error("Unsupported MLA EngineKVFormat");
       }
     }
   }
@@ -462,8 +418,12 @@ void multi_layer_kv_transfer(
     torch::Tensor& key_value, const torch::Tensor& key_value_ptrs,
     const torch::Tensor& slot_mapping, const torch::Device& paged_memory_device,
     const int page_buffer_size, const TransferDirection direction,
-    const GPUKVFormat gpu_kv_format, const int block_size,
-    const int skip_prefix_n_tokens) {
+    const EngineKVFormat engine_kv_format, const int block_size,
+    const int head_size, const int skip_prefix_n_tokens) {
+  // head_size is currently unused in the SYCL implementation; accepted to
+  // keep ABI parity with the CUDA cuda_ops binding so callers can pass the
+  // same kwargs to either backend.
+  (void)head_size;
   int num_origin_elements = key_value.size(3);
   int copy_size = num_origin_elements * key_value.element_size();
 
@@ -471,7 +431,7 @@ void multi_layer_kv_transfer(
   do {                                                                \
     multi_layer_kv_transfer_templated<type>(                          \
         key_value, key_value_ptrs, slot_mapping, paged_memory_device, \
-        page_buffer_size, direction, gpu_kv_format, block_size,       \
+        page_buffer_size, direction, engine_kv_format, block_size,    \
         skip_prefix_n_tokens);                                        \
   } while (0)
   if (copy_size % 8 == 0) {
@@ -490,7 +450,7 @@ void multi_layer_kv_transfer(
 // single_layer_kv_transfer — helper template
 // ---------------------------------------------------------------------------
 // USE_MLA and IS_D2H are template parameters so the compiler can
-// dead-strip the unused branch and emit straight-line code.
+// dead-strip the unused branch.
 template <bool USE_MLA, bool IS_D2H>
 void single_layer_kv_transfer_impl(sycl::queue& queue, int64_t* lmc_ptr,
                                    int64_t* vllm_ptr, const int64_t* slot_ptr,
@@ -552,7 +512,7 @@ void single_layer_kv_transfer(torch::Tensor& lmc_key_value_cache,
                               torch::Tensor& vllm_key_value_cache,
                               torch::Tensor& slot_mapping,
                               const TransferDirection direction,
-                              const GPUKVFormat gpu_kv_format,
+                              const EngineKVFormat engine_kv_format,
                               const bool token_major) {
   int64_t* lmc_key_value_cache_ptr =
       get_kernel_ptr<int64_t, torch::Tensor>(lmc_key_value_cache);
@@ -568,7 +528,7 @@ void single_layer_kv_transfer(torch::Tensor& lmc_key_value_cache,
   int head_size_in_64bit;
   int block_size;
 
-  const bool use_mla = lmc::is_mla(gpu_kv_format);
+  const bool use_mla = ::is_mla(engine_kv_format);
 
   if (use_mla) {
     num_heads = 1;
@@ -599,14 +559,18 @@ void single_layer_kv_transfer(torch::Tensor& lmc_key_value_cache,
     vllm_block_key_stride_in_64bit =
         vllm_key_value_cache.stride(0) / elements_per_entry;
     vllm_value_offset = 0;
-  } else if (gpu_kv_format == GPUKVFormat::NL_X_TWO_NB_BS_NH_HS) {
+  } else if (engine_kv_format == EngineKVFormat::NL_X_TWO_NB_BS_NH_HS) {
     vllm_block_key_stride_in_64bit =
         vllm_key_value_cache.stride(1) / elements_per_entry;
     vllm_value_offset = vllm_key_value_cache.stride(0) / elements_per_entry;
-  } else {  // NL_X_NB_TWO_BS_NH_HS
+  } else if (engine_kv_format == EngineKVFormat::NL_X_NB_TWO_BS_NH_HS) {
     vllm_block_key_stride_in_64bit =
         vllm_key_value_cache.stride(0) / elements_per_entry;
     vllm_value_offset = vllm_key_value_cache.stride(1) / elements_per_entry;
+  } else {
+    throw std::runtime_error(
+        "Unsupported non-MLA EngineKVFormat in single_layer_kv_transfer: " +
+        std::to_string(static_cast<int>(engine_kv_format)));
   }
 
   int n = num_heads * head_size_in_64bit;
@@ -622,9 +586,8 @@ void single_layer_kv_transfer(torch::Tensor& lmc_key_value_cache,
   auto vllm_ptr = vllm_key_value_cache_ptr;
   auto slot_ptr = slot_mapping_ptr;
 
-  // Dispatch to 4 compile-time specialisations
-  // (USE_MLA × IS_D2H) so the inner loop is
-  // branch-free.
+  // Dispatch to 4 compile-time specialisations (USE_MLA × IS_D2H)
+  // so the inner loop is branch-free.
   if (use_mla) {
     if (direction == TransferDirection::D2H)
       single_layer_kv_transfer_impl<true, true>(
@@ -811,9 +774,8 @@ void lmcache_memcpy_async(uintptr_t dest, uintptr_t src, size_t nbytes,
   TORCH_CHECK((host_buffer_alignments & (host_buffer_alignments - 1)) == 0,
               "host_buffer_alignments must be power of two");
 
-  // SYCL USM memcpy infers direction from pointer allocation types.
-  // The direction parameter is kept for API compatibility with the CUDA
-  // version but is not needed by the SYCL runtime.
+  // SYCL USM memcpy infers direction from pointer allocation types;
+  // the `direction` parameter is retained only for API compatibility.
   (void)direction;
 
   sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue();
@@ -830,11 +792,40 @@ void lmcache_memcpy_async(uintptr_t dest, uintptr_t src, size_t nbytes,
     size_t real_end = std::min(host_buffer_offset + nbytes, aligned_area_end);
     size_t max_nbytes = real_end - offset - host_buffer_offset;
 
-    // SYCL USM memcpy is direction-agnostic; the runtime resolves
-    // the copy direction from the pointer allocation types.
+    // USM memcpy is direction-agnostic.
     queue.memcpy(reinterpret_cast<void*>(current_dest),
                  reinterpret_cast<const void*>(current_src), max_nbytes);
 
     offset += max_nbytes;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Pinned host allocation (SYCL/XPU analog of the CUDA cudaHostAlloc path in
+// csrc/cuda/mem_alloc.cpp). LMCache local_cpu backend expects a
+// device-accessible (USM host) buffer; without this the XPU build silently fell
+// back to pageable host memory, dropping D2H store throughput ~20x.
+// sycl::malloc_host bound to the current XPU device context gives true
+// USM-pinned host memory.
+//
+// IMPORTANT: We use device 0's context for both alloc and free to ensure
+// context consistency. USM host memory is accessible from all devices, but
+// sycl::free() requires the same context used during allocation. Using device
+// 0 consistently avoids context mismatch when the current device changes
+// between allocation and deallocation.
+// ---------------------------------------------------------------------------
+uintptr_t alloc_pinned_ptr(size_t size, unsigned int flags) {
+  // Use device 0 context consistently for host memory allocation.
+  // DeviceGuard ensures we restore the original device after getting context.
+  const c10::DeviceGuard device_guard(c10::Device(c10::kXPU, 0));
+  void* ptr = sycl::malloc_host(size, c10::xpu::get_device_context());
+  TORCH_CHECK(ptr != nullptr, "sycl::malloc_host failed for ", size,
+              " bytes (XPU pinned host)");
+  return reinterpret_cast<uintptr_t>(ptr);
+}
+
+void free_pinned_ptr(uintptr_t ptr) {
+  // Use device 0 context consistently (must match alloc_pinned_ptr).
+  const c10::DeviceGuard device_guard(c10::Device(c10::kXPU, 0));
+  sycl::free(reinterpret_cast<void*>(ptr), c10::xpu::get_device_context());
 }

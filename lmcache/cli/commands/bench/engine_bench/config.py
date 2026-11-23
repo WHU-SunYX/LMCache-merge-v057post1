@@ -3,14 +3,20 @@
 
 # Standard
 from dataclasses import dataclass
+from enum import Enum
 import argparse
 import json
 import os
 import urllib.error
 import urllib.request
 
-# Third Party
-from openai import OpenAI
+try:
+    # Third Party
+    from openai import OpenAI
+except ModuleNotFoundError as exc:
+    if exc.name != "openai":
+        raise
+    OpenAI = None  # type: ignore[assignment]
 
 # First Party
 from lmcache.logging import init_logger
@@ -18,6 +24,23 @@ from lmcache.logging import init_logger
 logger = init_logger(__name__)
 
 _GB = 1024**3
+
+
+class WarmupPolicy(str, Enum):
+    """Whether the workload runs its warmup phase before the measured run.
+
+    Subclasses ``str`` so the value lands in the JSON summary
+    (``bench_summary.json``) as a plain ``"run"`` / ``"skip"`` string.
+
+    Attributes:
+        RUN: Run warmup, then discard its stats and start the benchmark.
+        SKIP: Go straight to the benchmark, leaving the engine and the KV
+            cache in whatever state the run starts in.  The first requests
+            then pay any first-request cost and see a cold cache.
+    """
+
+    RUN = "run"
+    SKIP = "skip"
 
 
 @dataclass
@@ -39,6 +62,8 @@ class EngineBenchConfig:
     export_csv: bool
     export_json: bool
     quiet: bool
+    ignore_eos: bool = False
+    warmup_policy: WarmupPolicy = WarmupPolicy.RUN
 
     def __post_init__(self) -> None:
         if not self.engine_url:
@@ -65,7 +90,8 @@ def auto_detect_model(engine_url: str) -> str:
         The model ID string.
 
     Raises:
-        RuntimeError: If the engine is unreachable or returns no models.
+        RuntimeError: If the optional OpenAI dependency is unavailable, the
+            engine is unreachable, or the engine returns no models.
     """
     base_url = engine_url.rstrip("/")
     if not base_url.startswith(("http://", "https://")):
@@ -75,6 +101,12 @@ def auto_detect_model(engine_url: str) -> str:
 
     api_key = os.getenv("OPENAI_API_KEY", "sk-dummy")
     logger.debug("Auto-detecting model from %s/models", base_url)
+
+    if OpenAI is None:
+        raise RuntimeError(
+            "lmcache bench engine requires the optional 'openai' package. "
+            "Install it with `pip install openai`."
+        )
 
     try:
         client = OpenAI(base_url=base_url, api_key=api_key)
@@ -125,7 +157,7 @@ def _find_model_meta(
     """Find the GPU metadata entry matching *model_name*.
 
     Args:
-        gpu_meta: The ``gpu_context_meta`` dict from ``/status``.
+        gpu_meta: The ``cache_context_meta`` dict from ``/status``.
         model_name: Model name to match.
 
     Returns:
@@ -143,6 +175,69 @@ def _find_model_meta(
         f"Model {model_name!r} not found on LMCache server. "
         f"Available: {', '.join(available)}"
     )
+
+
+def server_runs_blend_module(lmcache_url: str) -> bool:
+    """Report whether the LMCache server loaded the blend module.
+
+    Detected by the presence of ``active_cb_lookups`` in ``/status``, which
+    only :mod:`lmcache.v1.multiprocess.modules.blend` emits.  Two fields that
+    look like they would answer this do not: ``engine_type`` is
+    ``self.__class__.__name__`` and reads ``MPCacheServer`` for both engines,
+    and nothing in the codebase writes ``cb_gpu_context_meta``.  Tracked
+    upstream in #5589; switch to the reported engine once that lands.
+
+    This is a necessary but not sufficient condition for blended reuse -- it
+    says the server can blend, not that vLLM is driving it through
+    ``CBKVConnector``.  Confirm the end-to-end path by checking which lookup
+    counter family moves once traffic has run.
+
+    Args:
+        lmcache_url: URL of the LMCache HTTP server.
+
+    Returns:
+        True when the server reports the blend module.
+
+    Raises:
+        RuntimeError: If the server is unreachable.
+    """
+    return "active_cb_lookups" in _fetch_lmcache_status(lmcache_url)
+
+
+def resolve_l1_capacity_gb(lmcache_url: str) -> float:
+    """Query the LMCache server for the configured host-memory capacity.
+
+    Reads ``storage_manager.l1_manager.memory_total_bytes`` from ``/status``.
+    Workloads that size themselves against the cache need the real capacity,
+    not a figure the user retyped; a mistyped value silently produces a
+    working set that never exceeds L1, and a run that does no L2 I/O at all.
+
+    Args:
+        lmcache_url: URL of the LMCache HTTP server.
+
+    Returns:
+        Configured L1 capacity in GB.
+
+    Raises:
+        RuntimeError: If the server is unreachable, or ``/status`` does not
+            report an L1 capacity.
+    """
+    data = _fetch_lmcache_status(lmcache_url)
+    total = (
+        data.get("storage_manager", {}).get("l1_manager", {}).get("memory_total_bytes")
+    )
+    if total is None:
+        # Older servers report it directly on storage_manager.
+        total = data.get("storage_manager", {}).get("memory_total_bytes")
+    if not isinstance(total, (int, float)) or total <= 0:
+        raise RuntimeError(
+            f"LMCache at {lmcache_url} did not report an L1 capacity "
+            f"(storage_manager.l1_manager.memory_total_bytes). Pass an "
+            f"explicit pool size instead."
+        )
+    capacity_gb = float(total) / (1024**3)
+    logger.debug("Resolved L1 capacity %.2f GB from %s", capacity_gb, lmcache_url)
+    return capacity_gb
 
 
 def resolve_tokens_per_gb(lmcache_url: str, model_name: str) -> int:
@@ -171,10 +266,10 @@ def resolve_tokens_per_gb(lmcache_url: str, model_name: str) -> int:
     """
     data = _fetch_lmcache_status(lmcache_url)
 
-    gpu_meta = data.get("gpu_context_meta", {})
+    gpu_meta = data.get("cache_context_meta", {})
     if not gpu_meta:
         # CB-only deployments (engine_type="blend") populate
-        # cb_gpu_context_meta instead of gpu_context_meta.
+        # cb_gpu_context_meta instead of cache_context_meta.
         gpu_meta = data.get("cb_gpu_context_meta", {})
     if not gpu_meta:
         raise RuntimeError(
@@ -246,4 +341,8 @@ def parse_args_to_config(args: argparse.Namespace) -> EngineBenchConfig:
         export_csv=not args.no_csv,
         export_json=args.json,
         quiet=args.quiet,
+        ignore_eos=args.ignore_eos,
+        warmup_policy=(
+            WarmupPolicy.SKIP if getattr(args, "no_warmup", False) else WarmupPolicy.RUN
+        ),
     )

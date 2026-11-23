@@ -52,6 +52,28 @@ Therefore the framework enforces:
 | `connector_base.h` | `ConnectorBase<T>` — core harness (eventfd, SQ/CQ, threading, tiling). Override 4 required + 1 optional method per backend |
 | `connector_pybind_utils.h` | Pybind utilities with GIL release + `LMCACHE_BIND_CONNECTOR_METHODS` macro |
 | `redis/` | Reference implementation (RESP2 protocol over TCP) |
+| `aerospike/` | Optional native Aerospike backend (meta + segment sharding; `BUILD_AEROSPIKE=1`) |
+
+## Aerospike (optional build)
+
+The Aerospike connector is **not** built by default. Enable it when packaging or
+developing:
+
+Set ``AEROSPIKE_INCLUDE_DIR`` and ``AEROSPIKE_LIBRARY_DIR`` to a libaerospike
+development install (or use ``BUILD_AEROSPIKE=1`` after placing headers/libs under
+``.deps/`` as in ``.github/workflows/aerospike_integration.yml``), then:
+
+```bash
+BUILD_AEROSPIKE=1 pip install -e .
+```
+
+MP mode:
+
+```bash
+--l2-adapter '{"type": "aerospike", "hosts": "127.0.0.1:3000", "namespace": "lmcache", "set_name": "kv_chunks", "num_workers": 8}'
+```
+
+Config module: ``lmcache/v1/distributed/l2_adapters/aerospike_l2_adapter.py``.
 
 ## How to add a new native backend
 
@@ -168,7 +190,7 @@ cpp_extension.CppExtension(
     "lmcache.lmcache_mybackend",
     sources=mybackend_sources,
     include_dirs=["csrc/storage_backends", "csrc/storage_backends/mybackend"],
-    extra_compile_args={"cxx": ["-O3", "-std=c++17"]},
+    extra_compile_args={"cxx": ["-O3"]},
 ),
 ```
 
@@ -180,7 +202,7 @@ Inherit from `ConnectorClientBase` which provides asyncio event loop
 integration, future management, and both sync and async methods.
 
 ```python
-# lmcache/v1/storage_backend/native_clients/mybackend_client.py
+# lmcache/inprocess/v1/storage_backend/native_clients/mybackend_client.py
 from .connector_client_base import ConnectorClientBase
 from lmcache.lmcache_mybackend import LMCacheMyBackendClient
 
@@ -193,7 +215,7 @@ class MyBackendClient(ConnectorClientBase[LMCacheMyBackendClient]):
 This gives you `async get/set/exists`, `batch_get/batch_set/batch_exists`,
 and sync variants, all with automatic eventfd-driven completion handling.
 
-**Reference:** `lmcache/v1/storage_backend/native_clients/resp_client.py`
+**Reference:** `lmcache/inprocess/v1/storage_backend/native_clients/resp_client.py`
 
 ### Step 5: MP mode integration — L2 adapter config + factory
 
@@ -286,3 +308,4 @@ Python eventfd.
 - [ ] Python client inheriting `ConnectorClientBase` (non-MP mode)
 - [ ] L2 adapter config class + factory registration (MP mode)
 - [ ] Unit tests (see `tests/v1/distributed/test_native_connector_l2_adapter.py`)
+- [ ] Optional: Aerospike integration (`RUN_AEROSPIKE_INTEGRATION=1`, see `tests/v1/distributed/test_aerospike_l2_integration.py`)

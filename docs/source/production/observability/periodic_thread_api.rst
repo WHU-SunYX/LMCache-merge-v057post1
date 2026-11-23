@@ -3,6 +3,11 @@
 Periodic Thread Monitoring API
 ==============================
 
+.. warning::
+
+   This page documents the behavior of LMCache's in-process mode (deprecated). Please consider using :doc:`LMCache MP mode </mp/index>` for better feature support and performance.
+
+
 This document describes the Periodic Thread Monitoring API feature introduced
 in LMCache.
 
@@ -61,8 +66,8 @@ Returns information about all registered periodic threads.
       },
       "threads": [
         {
-          "name": "pin_monitor",
-          "level": "high",
+          "name": "health-monitor-thread",
+          "level": "critical",
           "is_running": true,
           "is_active": true,
           "last_run_time": 1706000000.0,
@@ -81,8 +86,8 @@ Returns detailed information about a specific periodic thread.
 .. code-block:: json
 
     {
-      "name": "pin_monitor",
-      "level": "high",
+      "name": "health-monitor-thread",
+      "level": "critical",
       "is_running": true,
       "is_active": true,
       "last_run_time": 1706000000.0,
@@ -172,4 +177,4 @@ Check Specific Thread Status
 
 .. code-block:: bash
 
-    curl http://localhost:8080/periodic-threads/pin_monitor
+    curl http://localhost:8080/periodic-threads/health-monitor-thread

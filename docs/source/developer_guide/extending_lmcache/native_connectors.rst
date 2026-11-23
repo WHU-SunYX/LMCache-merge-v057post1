@@ -1,5 +1,5 @@
-Adding Native Connectors
-========================
+Adding Native Backends
+======================
 
 .. _native-connectors-overview:
 
@@ -195,7 +195,7 @@ Register your C++ sources in ``setup.py`` alongside the existing Redis extension
             "csrc/storage_backends",
             "csrc/storage_backends/mybackend",
         ],
-        extra_compile_args={"cxx": ["-O3", "-std=c++17"]},
+        extra_compile_args={"cxx": ["-O3"]},
     ),
 
 Then rebuild:
@@ -213,7 +213,7 @@ future management, and both sync and async methods.
 
 .. code-block:: python
 
-    # lmcache/v1/storage_backend/native_clients/mybackend_client.py
+    # lmcache/inprocess/v1/storage_backend/native_clients/mybackend_client.py
     from .connector_client_base import ConnectorClientBase
     from lmcache.lmcache_mybackend import LMCacheMyBackendClient
 
@@ -226,7 +226,7 @@ future management, and both sync and async methods.
 This gives you ``batch_get``, ``batch_set``, ``batch_exists`` (async), and their
 synchronous variants, all with automatic eventfd-driven completion handling.
 
-**Reference:** ``lmcache/v1/storage_backend/native_clients/resp_client.py``
+**Reference:** ``lmcache/inprocess/v1/storage_backend/native_clients/resp_client.py``
 
 
 Step 5: L2 Adapter (MP Mode)
@@ -298,6 +298,11 @@ Create a new file in the L2 adapters package:
         l1_memory_desc: "Optional[L1MemoryDesc]" = None,
     ) -> L2AdapterInterface:
         from lmcache.lmcache_mybackend import LMCacheMyBackendClient
+        from lmcache.v1.distributed.api import (
+            MemoryResidency,
+            MemorySegment,
+            MemoryTags,
+        )
         from lmcache.v1.distributed.l2_adapters \
             .native_connector_l2_adapter import (
             NativeConnectorL2Adapter,
@@ -307,8 +312,10 @@ Create a new file in the L2 adapters package:
         native_client = LMCacheMyBackendClient(
             config.host, config.port, config.num_workers
         )
+        # A network service, so the bytes are remote storage.
         return NativeConnectorL2Adapter(
             native_client,
+            MemoryTags(MemorySegment.STORAGE, MemoryResidency.REMOTE),
             max_capacity_gb=config.max_capacity_gb,
         )
 
@@ -501,7 +508,7 @@ Loading Flow
       +-- getattr(module, config.class_name)
       +-- connector_cls(**config.adapter_params)
       +-- validate 6 required methods
-      +-- NativeConnectorL2Adapter(native_client)
+      +-- NativeConnectorL2Adapter(native_client, memory_tags)
               |
               v
       L2AdapterInterface instance (ready for use)
@@ -624,6 +631,49 @@ For **external** native connector plugins (``native_plugin``):
 5. Unit tests (see ``examples/lmc_external_native_connector/tests/``)
 
 
+Built-in Aerospike backend (optional)
+-------------------------------------
+
+LMCache ships an optional in-tree Aerospike native connector (same
+``ConnectorBase`` harness as Redis). It is compiled only when
+``BUILD_AEROSPIKE=1`` or ``AEROSPIKE_INCLUDE_DIR`` is set during
+``pip install -e .``.
+
+**Build:**
+
+.. code-block:: bash
+
+   See ``.github/workflows/aerospike_integration.yml`` for installing the C client into ``.deps/``
+   source .deps/aerospike-client-c.env
+   BUILD_AEROSPIKE=1 pip install -e .
+
+The ``aerospike-client-c.env`` file simply points the build at the C client
+headers and shared libraries you unpacked into ``.deps/``. Adjust the paths to
+match where the client was installed. Example:
+
+.. code-block:: bash
+
+   # .deps/aerospike-client-c.env
+   export AEROSPIKE_INCLUDE_DIR="${PWD}/.deps/aerospike-install/usr/include"
+   export AEROSPIKE_LIBRARY_DIR="${PWD}/.deps/aerospike-install/usr/lib"
+   # Needed at build and runtime so the loader can find libaerospike (and
+   # libyaml if you built it locally):
+   export LD_LIBRARY_PATH="${AEROSPIKE_LIBRARY_DIR}:${PWD}/.deps/libyaml-install/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+
+Setting ``AEROSPIKE_INCLUDE_DIR`` is enough to enable the extension, so
+``BUILD_AEROSPIKE=1`` is optional once the env file is sourced. Multiple include
+or library directories can be passed as ``;``-separated lists.
+
+**MP mode:**
+
+.. code-block:: bash
+
+   --l2-adapter '{"type": "aerospike", "hosts": "127.0.0.1:3000", "namespace": "lmcache", "set_name": "kv_chunks", "num_workers": 8}'
+
+Implementation: ``csrc/storage_backends/aerospike/``,
+``lmcache/v1/distributed/l2_adapters/aerospike_l2_adapter.py``.
+
+
 Additional Resources
 --------------------
 
@@ -632,6 +682,7 @@ Additional Resources
 - ``IStorageConnector`` interface: ``csrc/storage_backends/connector_interface.h``
 - Pybind utilities: ``csrc/storage_backends/connector_pybind_utils.h``
 - Redis reference implementation: ``csrc/storage_backends/redis/``
+- Aerospike implementation (optional): ``csrc/storage_backends/aerospike/``
 - Architecture README: ``csrc/storage_backends/README.md``
 - External native connector example:
   ``examples/lmc_external_native_connector/``

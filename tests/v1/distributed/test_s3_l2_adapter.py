@@ -17,7 +17,7 @@ import pytest
 import torch
 
 # First Party
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.internal_api import L2AdapterListener
 from lmcache.v1.distributed.l2_adapters import s3_l2_adapter as s3mod
 from lmcache.v1.distributed.l2_adapters.s3_l2_adapter import (
@@ -31,6 +31,8 @@ from lmcache.v1.memory_management import (
     TensorMemoryObj,
 )
 from lmcache.v1.platform import consume_fd
+
+_EMPTY_LAYOUT = MemoryLayoutDesc(shapes=[], dtypes=[])
 
 # =============================================================================
 # Fake awscrt.s3.S3Request
@@ -46,6 +48,9 @@ class _FakeBackend:
         # When non-None, every request raises with this message
         # (used to simulate network failures for the circuit-breaker test).
         self._inject_error: str | None = None
+        # When set, GET bodies are delivered in pieces of this many bytes
+        # at increasing offsets, as a ranged GET would.
+        self._get_chunk_size: int | None = None
         self._put_count = 0
         self._get_count = 0
         self._delete_count = 0
@@ -55,6 +60,7 @@ class _FakeBackend:
         with self._lock:
             self._data.clear()
             self._inject_error = None
+            self._get_chunk_size = None
             self._put_count = self._get_count = 0
             self._delete_count = self._head_count = 0
 
@@ -78,6 +84,14 @@ class _FakeBackend:
         with self._lock:
             self._inject_error = msg
 
+    def set_get_chunk_size(self, n: int | None):
+        with self._lock:
+            self._get_chunk_size = n
+
+    def get_chunk_size(self) -> int | None:
+        with self._lock:
+            return self._get_chunk_size
+
     def counts(self) -> dict[str, int]:
         with self._lock:
             return {
@@ -100,12 +114,78 @@ def _path_to_key(path: str) -> str:
     return unquote(path.lstrip("/"))
 
 
+def _build_list_objects_v2_response(
+    backend: "_FakeBackend",
+    prefix: str | None,
+    max_keys: int,
+    continuation_token: str | None,
+) -> bytes:
+    """Render a minimal ListObjectsV2 XML response from the fake backend.
+
+    The adapter's parser only consumes ``<Contents>/<Key>`` +
+    ``<Contents>/<Size>`` and ``<NextContinuationToken>``, so other
+    fields can be omitted. Continuation tokens here are just the
+    "start-after-this-key" cursor — opaque to the adapter, simple
+    enough for tests.
+    """
+    with backend._lock:
+        all_keys = sorted(backend._data.keys())
+        sizes = {k: len(backend._data[k]) for k in all_keys}
+
+    if prefix:
+        all_keys = [k for k in all_keys if k.startswith(prefix)]
+    if continuation_token is not None:
+        # In our fake, the token IS the last key returned on the
+        # previous page. Start strictly after it.
+        all_keys = [k for k in all_keys if k > continuation_token]
+
+    page = all_keys[:max_keys]
+    truncated = len(all_keys) > max_keys
+    next_token = page[-1] if (truncated and page) else None
+
+    body = ["<?xml version='1.0' encoding='UTF-8'?>"]
+    body.append("<ListBucketResult xmlns='http://s3.amazonaws.com/doc/2006-03-01/'>")
+    body.append(f"<IsTruncated>{'true' if truncated else 'false'}</IsTruncated>")
+    for k in page:
+        body.append(f"<Contents><Key>{k}</Key><Size>{sizes[k]}</Size></Contents>")
+    if next_token is not None:
+        body.append(f"<NextContinuationToken>{next_token}</NextContinuationToken>")
+    body.append("</ListBucketResult>")
+    return "".join(body).encode("utf-8")
+
+
+def _parse_list_query(path: str) -> tuple[str | None, int, str | None]:
+    """Pull ``prefix`` / ``max-keys`` / ``continuation-token`` out of the
+    ListObjectsV2 query string."""
+    # Standard
+    from urllib.parse import parse_qs, urlsplit
+
+    qs = parse_qs(urlsplit(path).query)
+    prefix = qs.get("prefix", [None])[0]
+    max_keys = int(qs.get("max-keys", ["1000"])[0])
+    cont = qs.get("continuation-token", [None])[0]
+    return prefix, max_keys, cont
+
+
+def _call_on_done(on_done, **kwargs) -> None:
+    """Invoke ``on_done`` the way the CRT does: after ``finished_future``
+    is settled, with any exception it raises dropped, never propagated.
+    A check that lives in ``on_done`` therefore cannot fail a request."""
+    if on_done is None:
+        return
+    try:
+        on_done(**kwargs)
+    except Exception:
+        pass
+
+
 class _FakeS3Request:
     """In-process substitute for awscrt.s3.S3Request.
 
     Dispatches by HTTP method + operation_name against ``_BACKEND`` and
-    fires the on_headers / on_body / on_done callbacks that the real CRT
-    would invoke, then completes the finished_future.
+    fires the on_headers / on_body callbacks that the real CRT would
+    invoke, then settles ``finished_future`` and only then calls
+    ``on_done``, in the CRT's order.
     """
 
     def __init__(
@@ -127,6 +207,29 @@ class _FakeS3Request:
         # Extract method + path from the HttpRequest
         method = request.method
         path = request.path
+
+        # ListObjectsV2 is dispatched as GET on the bucket root with a
+        # ``?list-type=2&...`` query string — intercept before the
+        # per-key GET branch below so it doesn't try to look up an
+        # object named "".
+        if (
+            method == "GET"
+            and operation_name == "ListObjectsV2"
+            and path.startswith("/?")
+        ):
+            prefix, max_keys, cont = _parse_list_query(path)
+            xml = _build_list_objects_v2_response(_BACKEND, prefix, max_keys, cont)
+            try:
+                if on_headers is not None:
+                    on_headers(200, [("content-type", "application/xml")])
+                if on_body is not None:
+                    on_body(xml, 0)
+                self.finished_future.set_result(None)
+                _call_on_done(on_done, error=None, status_code=200)
+            except Exception as e:
+                if not self.finished_future.done():
+                    self.finished_future.set_exception(e)
+            return
         key_str = _path_to_key(path)
 
         err_inj = _BACKEND._inject_error
@@ -146,29 +249,28 @@ class _FakeS3Request:
                     _BACKEND._put_count += 1
                 if on_headers is not None:
                     on_headers(200, [])
-                if on_done is not None:
-                    on_done(error=None, status_code=200)
                 self.finished_future.set_result(None)
+                _call_on_done(on_done, error=None, status_code=200)
 
             elif method == "GET":
                 with _BACKEND._lock:
                     _BACKEND._get_count += 1
                 data = _BACKEND.get(key_str)
                 if data is None:
-                    if on_done is not None:
-                        try:
-                            on_done(error=None, status_code=404)
-                        except Exception:
-                            pass
                     self.finished_future.set_exception(
                         RuntimeError(f"S3 GET 404 for {key_str}")
                     )
+                    _call_on_done(on_done, error=None, status_code=404)
                     return
                 if on_body is not None:
-                    on_body(data, 0)
-                if on_done is not None:
-                    on_done(error=None, status_code=200)
+                    step = _BACKEND.get_chunk_size() or max(len(data), 1)
+                    for off in range(0, len(data), step):
+                        on_body(data[off : off + step], off)
+                # The CRT completes ``finished_future`` before it invokes
+                # ``on_done``: an exception raised in ``on_done`` cannot
+                # fail a request that has already been reported done.
                 self.finished_future.set_result(None)
+                _call_on_done(on_done, error=None, status_code=200)
 
             elif method == "HEAD":
                 with _BACKEND._lock:
@@ -191,9 +293,8 @@ class _FakeS3Request:
                 _BACKEND.delete(key_str)
                 if on_headers is not None:
                     on_headers(204, [])
-                if on_done is not None:
-                    on_done(error=None, status_code=204)
                 self.finished_future.set_result(None)
+                _call_on_done(on_done, error=None, status_code=204)
 
             else:
                 self.finished_future.set_exception(
@@ -201,13 +302,9 @@ class _FakeS3Request:
                 )
 
         except Exception as e:
-            try:
-                if on_done is not None:
-                    on_done(error=str(e), status_code=None)
-            except Exception:
-                pass
             if not self.finished_future.done():
                 self.finished_future.set_exception(e)
+            _call_on_done(on_done, error=str(e), status_code=None)
 
 
 class _FakeHttpRequest:
@@ -271,6 +368,26 @@ def create_memory_obj(size: int = 16, fill_value: float = 1.0) -> TensorMemoryOb
     return TensorMemoryObj(raw_data, metadata, parent_allocator=None)
 
 
+def create_guarded_memory_obj(
+    size: int = 16, guard_value: float = -1.0
+) -> tuple[TensorMemoryObj, torch.Tensor]:
+    """A MemoryObj over the first ``size`` float32 elements of a tensor
+    twice that long. The second half is a sentinel: a copy that runs past
+    the logical buffer lands there, where the test can see it, instead of
+    in unrelated memory. Returns the object and the sentinel view."""
+    backing = torch.full((size * 2,), guard_value, dtype=torch.float32)
+    metadata = MemoryObjMetadata(
+        shape=torch.Size([size]),
+        dtype=torch.float32,
+        address=0,
+        phy_size=size * 4,
+        fmt=MemoryFormat.KV_2LTD,
+        ref_count=1,
+    )
+    obj = TensorMemoryObj(backing[:size], metadata, parent_allocator=None)
+    return obj, backing[size:]
+
+
 def wait_for_event_fd(event_fd: int, timeout: float = 5.0) -> bool:
     poll = select.poll()
     poll.register(event_fd, select.POLLIN)
@@ -308,7 +425,7 @@ class _RecordingListener(L2AdapterListener):
         self.accessed: list[list[ObjectKey]] = []
         self.deleted: list[list[ObjectKey]] = []
 
-    def on_l2_keys_stored(self, keys):
+    def on_l2_keys_stored(self, keys, sizes):
         self.stored.append(list(keys))
 
     def on_l2_keys_accessed(self, keys):
@@ -330,7 +447,16 @@ class TestObjectKeySerialization:
             model_name="llama",
             kv_rank=255,
         )
-        assert _object_key_to_string(key) == "llama@000000ff@00010203"
+        assert _object_key_to_string(key) == "llama@000000ff@0@00010203"
+
+    def test_object_group_id_embedded(self):
+        key = ObjectKey(
+            chunk_hash=b"\x00\x01\x02\x03",
+            model_name="llama",
+            kv_rank=255,
+            object_group_id=5,
+        )
+        assert _object_key_to_string(key) == "llama@000000ff@5@00010203"
 
     def test_cache_salt_appended(self):
         """A non-empty cache_salt must be included in the S3 object name so
@@ -347,8 +473,8 @@ class TestObjectKeySerialization:
             kv_rank=255,
             cache_salt="user-42",
         )
-        assert _object_key_to_string(base_key) == "llama@000000ff@00010203"
-        assert _object_key_to_string(salted) == "llama@000000ff@00010203@user-42"
+        assert _object_key_to_string(base_key) == "llama@000000ff@0@00010203"
+        assert _object_key_to_string(salted) == "llama@000000ff@0@00010203@user-42"
         assert _object_key_to_string(base_key) != _object_key_to_string(salted)
 
 
@@ -383,7 +509,7 @@ class TestStoreLookupLoad:
         assert completed[tid].is_successful()
 
         # Lookup
-        tid = adapter.submit_lookup_and_lock_task([key])
+        tid = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
         assert wait_for_event_fd(adapter.get_lookup_and_lock_event_fd())
         bm = adapter.query_lookup_and_lock_result(tid)
         assert bm is not None and bm.test(0) is True
@@ -406,7 +532,7 @@ class TestStoreLookupLoad:
 
         # Lookup 0, 1, 2, 3 — expect bitmap 1010
         keys = [create_object_key(i) for i in range(4)]
-        tid = adapter.submit_lookup_and_lock_task(keys)
+        tid = adapter.submit_lookup_and_lock_task(keys, {0: _EMPTY_LAYOUT})
         wait_for_event_fd(adapter.get_lookup_and_lock_event_fd())
         bm = adapter.query_lookup_and_lock_result(tid)
         assert bm is not None
@@ -426,10 +552,132 @@ class TestStoreLookupLoad:
 
     def test_query_lookup_returns_none_after_pop(self, adapter):
         key = create_object_key(1)
-        tid = adapter.submit_lookup_and_lock_task([key])
+        tid = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
         wait_for_event_fd(adapter.get_lookup_and_lock_event_fd())
         assert adapter.query_lookup_and_lock_result(tid) is not None
         assert adapter.query_lookup_and_lock_result(tid) is None
+
+
+# =============================================================================
+# Size validation on load
+# =============================================================================
+
+
+class TestLoadSizeValidation:
+    """The store is not trusted to hold objects of the expected size.
+
+    A GET must never write outside the destination buffer, and a load
+    is a hit only when exactly the destination's byte count arrived.
+    """
+
+    @staticmethod
+    def _store(adapter, key, obj) -> None:
+        tid = adapter.submit_store_task([key], [obj])
+        assert wait_for_event_fd(adapter.get_store_event_fd())
+        assert adapter.pop_completed_store_tasks()[tid].is_successful()
+
+    @staticmethod
+    def _load(adapter, keys, dsts):
+        tid = adapter.submit_load_task(keys, dsts)
+        assert wait_for_event_fd(adapter.get_load_event_fd())
+        bm = adapter.query_load_result(tid)
+        assert bm is not None
+        return bm
+
+    @staticmethod
+    def _replace_object(key, data: bytes) -> str:
+        key_str = s3mod._object_key_to_string(key)
+        _BACKEND.put(key_str, data)
+        return key_str
+
+    def test_short_object_is_a_miss(self, adapter):
+        # Stored at the right size, then replaced on the store by a
+        # shorter object under the same key. The cached size still says
+        # the object is complete, so the GET is issued and delivers half.
+        key = create_object_key(1)
+        self._store(adapter, key, create_memory_obj(fill_value=3.14))
+        data = _BACKEND.get(s3mod._object_key_to_string(key))
+        assert data is not None
+        key_str = self._replace_object(key, data[: len(data) // 2])
+
+        bm = self._load(adapter, [key], [create_memory_obj(fill_value=0.0)])
+        assert bm.test(0) is False
+        # The size cache no longer vouches for the key, so the next
+        # lookup asks S3 again instead of repeating the failed load.
+        assert key_str not in adapter._object_size_cache
+
+    def test_mismatching_cached_size_skips_the_get(self, adapter):
+        # A fresh adapter learns the size from HEAD during lookup; the
+        # load then sees it disagrees with the destination and does not
+        # transfer anything.
+        key = create_object_key(2)
+        dst = create_memory_obj(fill_value=0.0)
+        self._replace_object(key, b"\x55" * (dst.get_size() // 2))
+
+        tid = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
+        assert wait_for_event_fd(adapter.get_lookup_and_lock_event_fd())
+        lookup_bm = adapter.query_lookup_and_lock_result(tid)
+        assert lookup_bm is not None and lookup_bm.test(0) is True
+
+        gets_before = _BACKEND.counts()["get"]
+        bm = self._load(adapter, [key], [dst])
+        assert bm.test(0) is False
+        assert _BACKEND.counts()["get"] == gets_before
+        assert torch.all(dst.tensor == 0.0)
+
+    def test_oversized_object_is_rejected_before_any_copy(self, adapter):
+        # No cached size, so the GET is issued; the body is twice the
+        # destination and arrives in one callback. It must be refused
+        # before the first memmove: neither the buffer nor the guard
+        # region after it may change.
+        key = create_object_key(3)
+        dst, guard = create_guarded_memory_obj()
+        self._replace_object(key, b"\x7f" * (dst.get_size() * 2))
+
+        bm = self._load(adapter, [key], [dst])
+        assert bm.test(0) is False
+        assert torch.all(dst.tensor == -1.0)
+        assert torch.all(guard == -1.0)
+
+    def test_oversized_object_in_a_later_callback(self, adapter):
+        # The object grew after this adapter cached its size, so the
+        # size check before the GET passes and the body arrives in three
+        # pieces; the third would cross the end of the destination.
+        key = create_object_key(4)
+        dst, guard = create_guarded_memory_obj()
+        capacity = dst.get_size()
+        self._store(adapter, key, create_memory_obj(fill_value=2.0))
+        key_str = self._replace_object(key, b"\x7f" * (capacity * 3 // 2))
+        _BACKEND.set_get_chunk_size(capacity // 2)
+
+        bm = self._load(adapter, [key], [dst])
+        assert bm.test(0) is False
+        assert torch.all(guard == -1.0)
+        assert key_str not in adapter._object_size_cache
+
+    def test_fragmented_delivery_of_a_complete_object_is_a_hit(self, adapter):
+        key = create_object_key(5)
+        self._store(adapter, key, create_memory_obj(fill_value=1.5))
+        dst = create_memory_obj(fill_value=0.0)
+        _BACKEND.set_get_chunk_size(24)  # 64 bytes -> offsets 0, 24, 48
+
+        bm = self._load(adapter, [key], [dst])
+        assert bm.test(0) is True
+        assert torch.all(dst.tensor == 1.5)
+
+    def test_only_the_wrong_sized_key_misses(self, adapter):
+        keys = [create_object_key(i) for i in (10, 11, 12)]
+        for key in keys:
+            self._store(adapter, key, create_memory_obj(fill_value=1.0))
+        data = _BACKEND.get(s3mod._object_key_to_string(keys[1]))
+        assert data is not None
+        self._replace_object(keys[1], data[:8])
+
+        dsts = [create_memory_obj(fill_value=0.0) for _ in keys]
+        bm = self._load(adapter, keys, dsts)
+        assert (bm.test(0), bm.test(1), bm.test(2)) == (True, False, True)
+        assert torch.all(dsts[0].tensor == 1.0)
+        assert torch.all(dsts[2].tensor == 1.0)
 
 
 # =============================================================================
@@ -444,7 +692,7 @@ class TestEviction:
         adapter.pop_completed_store_tasks()
 
     def _lookup(self, adapter, key):
-        tid = adapter.submit_lookup_and_lock_task([key])
+        tid = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
         wait_for_event_fd(adapter.get_lookup_and_lock_event_fd())
         return adapter.query_lookup_and_lock_result(tid)
 
@@ -568,7 +816,9 @@ class TestCircuitBreaker:
         assert _BACKEND.counts()["put"] == put_before  # never reached the backend
 
         # Lookup and load also short-circuit to all-zero bitmaps.
-        tid = adapter.submit_lookup_and_lock_task([create_object_key(1)])
+        tid = adapter.submit_lookup_and_lock_task(
+            [create_object_key(1)], {0: _EMPTY_LAYOUT}
+        )
         wait_for_event_fd(adapter.get_lookup_and_lock_event_fd(), timeout=2.0)
         bm = adapter.query_lookup_and_lock_result(tid)
         assert bm is not None and bm.test(0) is False
@@ -610,7 +860,7 @@ class TestListener:
         wait_for_event_fd(adapter.get_store_event_fd())
         adapter.pop_completed_store_tasks()
 
-        tid = adapter.submit_lookup_and_lock_task([key])
+        tid = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
         wait_for_event_fd(adapter.get_lookup_and_lock_event_fd())
         adapter.query_lookup_and_lock_result(tid)
         time.sleep(0.05)
@@ -683,3 +933,132 @@ class TestFactoryRegistration:
             assert isinstance(adp, S3L2Adapter)
         finally:
             adp.close()
+
+
+# =============================================================================
+# list_l2_keys
+# =============================================================================
+#
+# These tests populate the fake S3 backend directly via ``_BACKEND.put``,
+# bypassing the adapter's store pipeline. The listing path is what's
+# under test: ListObjectsV2 dispatch, XML parse, prefix filter, and
+# cursor pagination.
+
+
+def _put_object(key: ObjectKey, size: int = 0) -> None:
+    """Place a key in the fake S3 backend with deterministic content.
+
+    Mirrors the production PUT pipeline: ``_object_key_to_string`` →
+    ``_format_safe_path`` (URL-encoding only — no path-flattening) →
+    URL-unquote in the fake → backend storage. So the fake's stored
+    name is byte-identical to the literal S3 object name a real PUT
+    would land.
+    """
+    # First Party
+    from lmcache.v1.distributed.l2_adapters.s3_l2_adapter import (
+        _object_key_to_string,
+    )
+
+    _BACKEND.put(_object_key_to_string(key), b"\x00" * size)
+
+
+class TestS3L2AdapterListKeys:
+    def test_empty_bucket_returns_empty_page(self, adapter):
+        page = adapter.list_l2_keys()
+        assert page.entries == ()
+        assert page.next_page_token is None
+
+    def test_lists_all_keys_when_unfiltered(self, adapter):
+        for i in range(3):
+            _put_object(create_object_key(i, model_name="llama"), size=100 + i)
+
+        page = adapter.list_l2_keys(page_size=10)
+
+        assert len(page.entries) == 3
+        assert {e.size_bytes for e in page.entries} == {100, 101, 102}
+        assert page.next_page_token is None
+
+    def test_model_name_pushed_down_as_prefix(self, adapter):
+        llama = ObjectKey(chunk_hash=b"\x00" * 4, model_name="llama", kv_rank=0)
+        mistral = ObjectKey(chunk_hash=b"\x00" * 4, model_name="mistral", kv_rank=0)
+        _put_object(llama, size=1)
+        _put_object(mistral, size=1)
+
+        page = adapter.list_l2_keys(model_name="llama", page_size=10)
+        assert [e.key for e in page.entries] == [llama.to_encoded_object_key()]
+
+    def test_model_name_with_slash_round_trips(self, adapter):
+        # Real HF model ids contain ``/``. The adapter stores the
+        # literal object name on S3 (no path-flattening) and the
+        # listing decodes it back unchanged.
+        original = ObjectKey(
+            chunk_hash=b"\xde\xad\xbe\xef",
+            model_name="meta-llama/Llama-3.1-8B",
+            kv_rank=7,
+        )
+        encoded = original.to_encoded_object_key()
+        _put_object(original, size=128)
+
+        # The listing returns the original model_name (slash intact).
+        page = adapter.list_l2_keys(page_size=10)
+        assert len(page.entries) == 1
+        assert page.entries[0].key == encoded
+        assert page.entries[0].key.model_name == "meta-llama/Llama-3.1-8B"
+
+        # And the model_name filter accepts the caller-supplied form
+        # verbatim — no encoding magic to remember.
+        page = adapter.list_l2_keys(model_name="meta-llama/Llama-3.1-8B", page_size=10)
+        assert [e.key for e in page.entries] == [encoded]
+
+    def test_pagination_cursor_walks_full_set(self, adapter):
+        # 5 keys, page_size=2 → expect 3 calls: (0,1), (2,3), (4,).
+        for i in range(5):
+            _put_object(create_object_key(i, model_name="llama"), size=1)
+
+        collected = []
+        cursor = None
+        while True:
+            page = adapter.list_l2_keys(page_size=2, cursor=cursor)
+            collected.extend(page.entries)
+            cursor = page.next_page_token
+            if cursor is None:
+                break
+        assert len(collected) == 5
+
+    def test_page_size_must_be_positive(self, adapter):
+        with pytest.raises(ValueError):
+            adapter.list_l2_keys(page_size=0)
+
+    def test_page_size_clamped_to_s3_max(self, adapter):
+        # Ask for far more than S3's MaxKeys ceiling. The adapter
+        # clamps internally and the fake honors whatever it receives,
+        # so 5 keys come back without error.
+        for i in range(5):
+            _put_object(create_object_key(i, model_name="m"), size=1)
+        page = adapter.list_l2_keys(page_size=999_999)
+        assert len(page.entries) == 5
+        assert page.next_page_token is None
+
+    def test_circuit_breaker_blocks_listing(self, adapter):
+        # When the connection is disabled, listing must surface a
+        # clear error instead of issuing a doomed request.
+        with adapter._lock:
+            adapter._connection_disabled = True
+        with pytest.raises(RuntimeError) as exc:
+            adapter.list_l2_keys()
+        assert "disabled" in str(exc.value)
+
+    def test_unparsable_objects_silently_skipped(self, adapter):
+        # An object with a name that isn't this adapter's format
+        # (e.g. left behind by another tool) must not poison the
+        # response — it's just dropped from the listing.
+        _put_object(create_object_key(0, model_name="m"), size=1)
+        _BACKEND.put("not-our-format-key", b"junk")
+
+        page = adapter.list_l2_keys(page_size=10)
+
+        assert len(page.entries) == 1
+        assert (
+            page.entries[0].key
+            == create_object_key(0, model_name="m").to_encoded_object_key()
+        )

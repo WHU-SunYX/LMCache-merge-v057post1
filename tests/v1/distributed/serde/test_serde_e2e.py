@@ -3,7 +3,7 @@
 End-to-end tests for the serde integration through StorageManager.
 
 Drives the full L1 -> L2 store (with serialize) and L2 -> L1 prefetch
-(with deserialize) paths using a real L1Manager + MockL2Adapter +
+(with deserialize) paths using a real BaseL1Manager + MockL2Adapter +
 AsyncSerdeProcessor(fp8). Tests exercise the public StorageManager API
 only (no private-member access), per AGENTS.md.
 
@@ -24,7 +24,11 @@ import pytest
 import torch
 
 # First Party
-from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache import torch_dev, torch_device_type
+from lmcache.v1.distributed.api import (
+    MemoryLayoutDesc,
+    ObjectKey,
+)
 from lmcache.v1.distributed.config import (
     EvictionConfig,
     L1ManagerConfig,
@@ -34,22 +38,21 @@ from lmcache.v1.distributed.config import (
 from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import MockL2AdapterConfig
 from lmcache.v1.distributed.serde import SerdeConfig
-from lmcache.v1.distributed.storage_manager import StorageManager
+from lmcache.v1.distributed.storage_manager import StorageManager, l1_owners_of
+from lmcache.v1.platform import current_device_spec
 
-# Skip all tests in this module if CUDA is not available
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA is not available"
-)
+# Test helpers
+from tests.v1.distributed.utils import single_row_spec
 
+if not torch_dev.is_available():
+    pytest.skip(
+        f"Requires available {torch_device_type} runtime",
+        allow_module_level=True,
+    )
 
 # =============================================================================
 # Helpers
 # =============================================================================
-
-
-def should_use_lazy_alloc() -> bool:
-    """Determine if lazy allocation should be used based on CUDA availability."""
-    return torch.cuda.is_available()
 
 
 def make_object_key(chunk_id: int) -> ObjectKey:
@@ -94,7 +97,7 @@ def wait_for_prefetch_status(
     while time.monotonic() < deadline:
         result = sm.query_prefetch_status(handle)
         if result is not None:
-            return result
+            return result.hit_cells[0].count_leading_ones()
         time.sleep(poll_interval)
     return None
 
@@ -122,12 +125,19 @@ def make_storage_manager_config(
         l1_manager_config=L1ManagerConfig(
             memory_config=L1MemoryManagerConfig(
                 size_in_bytes=l1_size_mb * 1024 * 1024,
-                use_lazy=should_use_lazy_alloc(),
+                use_lazy=current_device_spec.is_pin_supported,
                 init_size_in_bytes=min(l1_size_mb, 64) * 1024 * 1024,
             ),
         ),
         eviction_config=EvictionConfig(eviction_policy="LRU"),
         l2_adapter_config=L2AdaptersConfig(adapters=list(adapter_configs)),
+    )
+
+
+def get_l2_stored_object_count(sm: StorageManager) -> int:
+    """Return the total stored object count across all L2 adapters."""
+    return sum(
+        adapter["stored_object_count"] for adapter in sm.report_status()["l2_adapters"]
     )
 
 
@@ -141,7 +151,9 @@ def write_and_wait_for_l2(
 
     Fills each chunk with deterministic data so round-trip can be verified.
     """
-    ret = sm.reserve_write(keys, layout, mode="new")
+    stored_before = get_l2_stored_object_count(sm)
+
+    ret = sm.reserve_write(keys, layout)
     assert len(ret) == len(keys), f"reserve_write: {len(ret)}/{len(keys)} succeeded"
 
     # Fill with deterministic data per key
@@ -151,17 +163,28 @@ def write_and_wait_for_l2(
         if tensor is not None:
             tensor.fill_(float(i + 1))
 
-    sm.finish_write(list(ret.keys()))
+    sm.finish_write(list(ret), l1_owners_of(ret))
 
-    # Wait for StoreController to flush to L2.
-    # We poll the store_controller status for in_flight==0 and pending==0.
-    ok = wait_for_condition(
-        lambda: (
-            sm.report_status()["store_controller"]["in_flight_task_count"] == 0
-            and sm.report_status()["store_controller"]["pending_keys_count"] == 0
-        ),
-        timeout=timeout,
-    )
+    # Wait for StoreController to flush to L2. Polling the controller's queue
+    # counters alone is racy: the background loop pops the pending keys
+    # (pending_keys_count -> 0) before it submits the store tasks
+    # (in_flight_task_count is still 0 in between), so a poll landing in that
+    # window declares the store complete before anything reached L2. Anchor
+    # the wait on the adapters' stored object counts, then use the queue
+    # counters only to confirm the controller has settled.
+    def flushed_to_l2() -> bool:
+        status = sm.report_status()
+        stored_total = sum(
+            adapter["stored_object_count"] for adapter in status["l2_adapters"]
+        )
+        store_controller = status["store_controller"]
+        return (
+            stored_total >= stored_before + len(keys)
+            and store_controller["in_flight_task_count"] == 0
+            and store_controller["pending_keys_count"] == 0
+        )
+
+    ok = wait_for_condition(flushed_to_l2, timeout=timeout)
     assert ok, "Store to L2 did not complete within timeout"
 
 
@@ -173,6 +196,29 @@ def get_l1_memory_used(sm: StorageManager) -> int:
 def get_l1_object_count(sm: StorageManager) -> int:
     """Return current L1 object count via public report_status."""
     return sm.report_status()["l1_manager"]["total_object_count"]
+
+
+def clear_and_wait_drained(sm: StorageManager, timeout: float = 10.0) -> None:
+    """Clear L1 and poll until every object is evicted.
+
+    After an L2 store the StoreController holds read locks on the stored objects
+    for a short window, and ``StorageManager.clear`` keeps locked objects intact.
+    A single clear right after the store therefore races the lock release and can
+    leave objects behind. Retry clear() until the locks drop and L1 drains rather
+    than relying on a fixed sleep.
+
+    Raises:
+        AssertionError: If L1 still holds objects after ``timeout`` seconds.
+    """
+
+    def drained() -> bool:
+        sm.clear()
+        return get_l1_object_count(sm) == 0
+
+    if not wait_for_condition(drained, timeout=timeout):
+        raise AssertionError(
+            f"L1 did not drain after clear: {get_l1_object_count(sm)} objects remain"
+        )
 
 
 # =============================================================================
@@ -196,13 +242,11 @@ class TestSerdeRoundTrip:
 
         write_and_wait_for_l2(sm, keys, layout)
 
-        # Brief sleep so StoreController releases read locks after L2 store
-        time.sleep(0.1)
-        sm.clear()
+        clear_and_wait_drained(sm)
         assert get_l1_object_count(sm) == 0
 
         # Prefetch from L2
-        handle = sm.submit_prefetch_task(keys, layout)
+        handle = sm.submit_prefetch_task(single_row_spec(keys, layout))
         hits = wait_for_prefetch_status(sm, handle)
         assert hits == 5, f"Expected 5 L2 hits, got {hits}"
 
@@ -222,11 +266,10 @@ class TestSerdeRoundTrip:
         keys = [make_object_key(i) for i in range(3)]
 
         write_and_wait_for_l2(sm, keys, layout)
-        time.sleep(0.1)
-        sm.clear()
+        clear_and_wait_drained(sm)
 
         # Prefetch
-        handle = sm.submit_prefetch_task(keys, layout)
+        handle = sm.submit_prefetch_task(single_row_spec(keys, layout))
         hits = wait_for_prefetch_status(sm, handle)
         assert hits == 3
 
@@ -263,10 +306,9 @@ class TestSerdeDisabled:
         keys = [make_object_key(i) for i in range(5)]
 
         write_and_wait_for_l2(sm, keys, layout)
-        time.sleep(0.1)
-        sm.clear()
+        clear_and_wait_drained(sm)
 
-        handle = sm.submit_prefetch_task(keys, layout)
+        handle = sm.submit_prefetch_task(single_row_spec(keys, layout))
         hits = wait_for_prefetch_status(sm, handle)
         assert hits == 5
 
@@ -285,10 +327,9 @@ class TestSerdeDisabled:
         keys = [make_object_key(i) for i in range(3)]
 
         write_and_wait_for_l2(sm, keys, layout)
-        time.sleep(0.1)
-        sm.clear()
+        clear_and_wait_drained(sm)
 
-        handle = sm.submit_prefetch_task(keys, layout)
+        handle = sm.submit_prefetch_task(single_row_spec(keys, layout))
         hits = wait_for_prefetch_status(sm, handle)
         assert hits == 3
         sm.finish_read_prefetched(keys)
@@ -318,12 +359,11 @@ class TestSerdePartialPrefix:
         # Write only keys 0, 1, 3, 4 (skip 2)
         keys_to_write = [make_object_key(i) for i in [0, 1, 3, 4]]
         write_and_wait_for_l2(sm, keys_to_write, layout)
-        time.sleep(0.1)
-        sm.clear()
+        clear_and_wait_drained(sm)
 
         # Request all 5 keys — prefix should be 2 (gap at index 2)
         all_keys = [make_object_key(i) for i in range(5)]
-        handle = sm.submit_prefetch_task(all_keys, layout)
+        handle = sm.submit_prefetch_task(single_row_spec(all_keys, layout))
         hits = wait_for_prefetch_status(sm, handle)
 
         assert hits is not None
@@ -354,10 +394,9 @@ class TestSerdeMemoryStress:
         for cycle in range(5):
             keys = [make_object_key(cycle * 10 + i) for i in range(3)]
             write_and_wait_for_l2(sm, keys, layout)
-            time.sleep(0.1)
-            sm.clear()
+            clear_and_wait_drained(sm)
 
-            handle = sm.submit_prefetch_task(keys, layout)
+            handle = sm.submit_prefetch_task(single_row_spec(keys, layout))
             hits = wait_for_prefetch_status(sm, handle)
             assert hits == 3, f"Cycle {cycle}: expected 3 hits, got {hits}"
             sm.finish_read_prefetched(keys)
@@ -388,7 +427,7 @@ class TestSerdeNoHits:
         layout = make_layout()
 
         keys = [make_object_key(i) for i in range(3)]
-        handle = sm.submit_prefetch_task(keys, layout)
+        handle = sm.submit_prefetch_task(single_row_spec(keys, layout))
         hits = wait_for_prefetch_status(sm, handle)
 
         assert hits is not None
@@ -441,11 +480,10 @@ class TestSerdeBufferBounds:
         keys = [make_object_key(i) for i in range(num_keys)]
 
         write_and_wait_for_l2(sm, keys, layout)
-        time.sleep(0.1)
-        sm.clear()
+        clear_and_wait_drained(sm)
         assert get_l1_object_count(sm) == 0
 
-        handle = sm.submit_prefetch_task(keys, layout)
+        handle = sm.submit_prefetch_task(single_row_spec(keys, layout))
         hits = wait_for_prefetch_status(sm, handle)
         assert hits == num_keys, f"Expected {num_keys} hits, got {hits}"
 

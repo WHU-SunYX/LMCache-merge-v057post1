@@ -13,15 +13,17 @@ from typing import (
 )
 
 if TYPE_CHECKING:
+    # First Party
     from lmcache.v1.distributed.internal_api import (
         L1MemoryDesc,
+    )
+    from lmcache.v1.distributed.l2_adapters.base import (
+        L2AdapterInterface,
     )
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.l2_adapters.base import (
-    L2AdapterInterface,
-)
+from lmcache.v1.distributed.api import MemoryResidency, MemorySegment, MemoryTags
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
     register_l2_adapter_type,
@@ -206,7 +208,9 @@ def _create_mooncake_store_l2_adapter(
         config.per_op_workers,
         l1_registration.enabled and l1_registration.size > 0,
     )
-    return NativeConnectorL2Adapter(native_client)
+    return NativeConnectorL2Adapter(
+        native_client, MemoryTags(MemorySegment.STORAGE, MemoryResidency.REMOTE)
+    )
 
 
 # Self-register config type and adapter factory
