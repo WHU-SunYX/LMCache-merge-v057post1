@@ -136,7 +136,8 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
             # non-contiguous logical view (NHD) that must be permuted back to
             # the physical (HND) shape for correct kernel indexing.
             # attempt_permute_to_contiguous_view is a no-op when already contiguous.
-            self.kvcaches = attempt_permute_to_contiguous_view(self.kvcaches)
+            if "vllm_packed_layout" not in getattr(self, "layout_hints", {}):
+                self.kvcaches = attempt_permute_to_contiguous_view(self.kvcaches)
 
 
 class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):

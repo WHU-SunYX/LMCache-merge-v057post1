@@ -570,11 +570,16 @@ class RequestTracker:
         request_configs = extract_request_configs(new_request.sampling_params)
 
         mm_hashes, mm_positions = extract_mm_features(new_request, modify=True)
+        # vLLM can send a resumed request as a new worker request, including
+        # already generated tokens that must be replayed as prefill.
+        prefill_token_ids = getattr(new_request, "prefill_token_ids", None)
+        if prefill_token_ids is None:
+            prefill_token_ids = new_request.prompt_token_ids
 
         return RequestTracker(
             req_id=new_request.req_id,
             prompt_len=len(new_request.prompt_token_ids),
-            token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
+            token_ids=list(prefill_token_ids[:num_tokens_to_compute]),
             allocated_block_ids=unfolded_block_ids,
             num_saved_tokens=lmcache_cached_tokens,
             disagg_spec=disagg_spec,
@@ -1324,13 +1329,18 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
                 continue
 
             if layer_name not in self.kv_caches:
-                self.kv_caches[layer_name] = attn_layer.kv_cache[
-                    forward_context.virtual_engine
-                ]
+                cache = attn_layer.kv_cache
+                if isinstance(cache, (list, tuple)):
+                    cache = cache[getattr(forward_context, "virtual_engine", 0)]
+                self.kv_caches[layer_name] = cache
 
     ####################
     # Worker side APIs
     ####################
+    def requires_load_before_forward(self) -> bool:
+        """Return whether the worker needs the load hook on every real step."""
+        return self.sparse_kv_spec.enabled or self.config.use_layerwise
+
     @_lmcache_nvtx_annotate
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         logger.info("Registering KV caches")
@@ -1785,7 +1795,7 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
         # reads the persistent tensors.
         if getattr(self, "sparse_kv_spec", SparseKVSpec()).enabled:
             try:
-                self.prepare_sparse_kv_step(forward_context=forward_context)
+                self.prepare_sparse_kv_step(forward_context=forward_context, **kwargs)
             except Exception:
                 logger.exception("[sparse-kv-step] prepare failed in start_load_kv")
                 raise
@@ -3899,7 +3909,10 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
         local_runtime_requests = (
             getattr(self, "_sparse_local_runtime_requests", {}) or {}
         )
-        attn_metadata = getattr(forward_context, "attn_metadata", None)
+        attn_metadata = kwargs.get("attn_metadata")
+        if attn_metadata is None:
+            attn_metadata = getattr(forward_context, "attn_metadata", None)
+        forward_req_ids = kwargs.get("request_ids")
 
         req_ids: list[str] = []
         token_lens: list[int] = []
@@ -3912,7 +3925,11 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
         selected_block_rows: list[list[int]] = []
         runtime_items: list[dict[str, Any]] = []
 
-        for req_id, runtime in runtime_requests.items():
+        ordered_ids = runtime_requests if forward_req_ids is None else forward_req_ids
+        for req_id in ordered_ids:
+            runtime = runtime_requests.get(req_id)
+            if runtime is None:
+                continue
             slot_mapping = runtime.get("slot_mapping")
             if not isinstance(slot_mapping, torch.Tensor) or slot_mapping.numel() == 0:
                 continue
@@ -4191,22 +4208,27 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
         self._publish_sparse_local_metadata(
             step_context, local_runtime_requests
         )
+        if (
+            forward_req_ids is not None
+            and step_context.get("host_sparse_decode_ready")
+            and step_context["req_ids"] != list(forward_req_ids)
+        ):
+            raise RuntimeError("AI-SSD sparse decode rows differ from the model batch")
         self._log_sparse_context_ptr("prepare-final", step_context)
-        targets = [] if attn_metadata is None else [attn_metadata]
-        if attn_metadata is not None:
-            common_meta = getattr(attn_metadata, "common_metadata", None)
-            if common_meta is not None and common_meta is not attn_metadata:
-                targets.append(common_meta)
-        for target in targets:
-            try:
-                setattr(target, "sparse_kv_step_context", step_context)
-                setattr(target, "sparse_kv_step_ready", True)
-            except Exception:
-                logger.debug(
-                    "[sparse-kv-step] failed to attach step context to %s",
-                    type(target).__name__,
-                    exc_info=True,
-                )
+        metadata_batches = attn_metadata if isinstance(attn_metadata, list) else [attn_metadata]
+        targets = {}
+        for batch in metadata_batches:
+            for layer_meta in batch.values() if isinstance(batch, dict) else (batch,):
+                if layer_meta is None:
+                    continue
+                targets[id(layer_meta)] = layer_meta
+                common_meta = getattr(layer_meta, "common_metadata", None)
+                if common_meta is not None:
+                    targets[id(common_meta)] = common_meta
+        for target in targets.values():
+            if hasattr(target, "__dict__"):
+                target.sparse_kv_step_context = step_context
+                target.sparse_kv_step_ready = True
 
         self._resident_publish_context(step_context)
         self._sparse_current_step_context = step_context
@@ -5662,7 +5684,7 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
             num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
             # TODO: this is a dangerous reference to the request object inside vllm
             if request := self._unfinished_requests.get(req_id):
-                num_current_tokens = request.num_computed_tokens
+                num_current_tokens = cached_reqs.num_computed_tokens[i]
                 # tracker_len < num_computed_tokens during decode
                 #   (important for save_decode_cache).
                 # num_computed_tokens < tracker_len after preemption.
@@ -5694,12 +5716,8 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
                 # Old version with resumed_from_preemption
                 preempted = cached_reqs.resumed_from_preemption[i]
             else:
-                # This case should not be reached with supported vLLM versions.
-                # Raising an error is safer than assuming not preempted.
-                raise AttributeError(
-                    f"Unable to determine preemption status for request {req_id}. "
-                    f"This might be due to an unsupported vLLM version."
-                )
+                # vLLM sends resumed requests in scheduled_new_reqs.
+                preempted = False
             if preempted:
                 assert load_spec is not None, (
                     f"Request {req_id} is preempted but was not given a load spec"
@@ -5719,9 +5737,9 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
                 )
                 if full_hit_adj:
                     expected -= 1
-                assert request.num_computed_tokens == expected, (
+                assert num_current_tokens == expected, (
                     f"Preempted request {req_id} has "
-                    f"num_computed_tokens {request.num_computed_tokens} "
+                    f"num_computed_tokens {num_current_tokens} "
                     f"but expected {expected} "
                     f"(full_hit_adj={full_hit_adj})"
                 )

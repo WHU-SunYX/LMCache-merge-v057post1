@@ -15,15 +15,100 @@ pytestmark = pytest.mark.skipif(
 
 # First Party
 from lmcache.v1.gpu_connector.utils import (  # noqa: E402
+    EngineType,
     attempt_permute_to_contiguous_view,
+    get_block_size,
     get_device,
     get_dtype,
     get_group_data_ptrs,
     get_head_size,
     get_num_heads,
     make_page_buffer_shape_desc,
+    normalize_kv_and_discover_format,
 )
 import lmcache.c_ops as lmc_ops  # noqa: E402
+
+
+@pytest.mark.parametrize("layout", ["LBNHC", "LBHNC"])
+@pytest.mark.parametrize("num_heads", [1, 2])
+@pytest.mark.parametrize("layerwise", [False, True])
+def test_packed_vllm_transfer_preserves_kv_planes(
+    layout: str, num_heads: int, layerwise: bool
+) -> None:
+    """Archive K/V planes independently of vLLM's packed page strides."""
+    num_blocks, block_size, head_dim = 3, 16, 8
+    shape = (num_blocks, num_heads, block_size, 2 * head_dim)
+    if layout == "LBNHC":
+        physical_shape = (num_blocks, block_size, num_heads, 2 * head_dim)
+        cache = torch.arange(
+            num_blocks * block_size * num_heads * 2 * head_dim,
+            dtype=torch.float16,
+            device="cuda",
+        ).reshape(physical_shape).transpose(1, 2)
+    else:
+        cache = torch.arange(
+            num_blocks * block_size * num_heads * 2 * head_dim,
+            dtype=torch.float16,
+            device="cuda",
+        ).reshape(shape)
+    fmt, physical = normalize_kv_and_discover_format(
+        [cache], EngineType.VLLM, {"vllm_packed_layout": layout}
+    )
+    assert physical[0].data_ptr() == cache.data_ptr()
+    assert get_block_size(physical, fmt) == block_size
+    assert get_num_heads(physical, fmt) == num_heads
+    assert get_head_size(physical, fmt) == head_dim
+
+    slots = [17, -1, 35]
+    slot_mapping = torch.tensor(slots, dtype=torch.long, device=cache.device)
+    planes = torch.full(
+        (2, len(slots), num_heads * head_dim),
+        -1,
+        dtype=cache.dtype,
+        device=cache.device,
+    )
+    ptrs = torch.tensor(
+        get_group_data_ptrs(physical, fmt, [0]), dtype=torch.long, device=cache.device
+    )
+
+    def transfer(direction: lmc_ops.TransferDirection) -> None:
+        if layerwise:
+            lmc_ops.single_layer_kv_transfer(
+                planes, physical[0], slot_mapping, direction, fmt
+            )
+        else:
+            lmc_ops.multi_layer_kv_transfer(
+                planes.unsqueeze(1),
+                ptrs,
+                slot_mapping,
+                cache.device,
+                num_blocks * block_size,
+                direction,
+                fmt,
+                block_size=block_size,
+                head_size=head_dim,
+            )
+
+    expected = torch.full_like(planes, -1)
+    for i, slot in enumerate(slots):
+        if slot >= 0:
+            block, token = divmod(slot, block_size)
+            key, value = cache[block, :, token].split(head_dim, dim=-1)
+            expected[0, i] = key.reshape(-1)
+            expected[1, i] = value.reshape(-1)
+    transfer(lmc_ops.TransferDirection.D2H)
+    torch.testing.assert_close(planes, expected, rtol=0, atol=0)
+
+    planes.neg_()
+    expected_cache = cache.clone()
+    for i, slot in enumerate(slots):
+        if slot >= 0:
+            block, token = divmod(slot, block_size)
+            expected_cache[block, :, token] = planes[:, i].reshape(
+                2, num_heads, head_dim
+            ).transpose(0, 1).reshape(num_heads, 2 * head_dim)
+    transfer(lmc_ops.TransferDirection.H2D)
+    torch.testing.assert_close(cache, expected_cache, rtol=0, atol=0)
 
 
 def test_make_shape_desc_vllm_flash_attn_nhd():

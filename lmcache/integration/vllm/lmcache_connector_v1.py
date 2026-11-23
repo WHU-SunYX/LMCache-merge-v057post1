@@ -47,6 +47,10 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
     # ==============================
     # Worker-side methods
     # ==============================
+    def requires_load_before_forward(self) -> bool:
+        """Return whether a real forward needs the adapter's step setup."""
+        return self._lmcache_engine.requires_load_before_forward()
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """
         Initialize with the KV caches. Useful for pre-registering the

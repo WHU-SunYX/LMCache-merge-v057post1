@@ -16,6 +16,8 @@ import re
 import sys
 import time
 
+from lmcache.integration.vllm.aissd_page_access import page_major
+
 ALGORITHM = "pq_codebook_lookup_topm"
 CAPTURE_SCHEMA = "aissd-gpu-coarse-diagnostic-v1"
 GLOBAL_ALGORITHMS = ("global_token_head_topm", "flat_token_head_topm")
@@ -270,11 +272,9 @@ def build_layers(kv_caches, block_ids, prefix_tokens, chunk_size, block_size,
             if match is None:
                 raise RuntimeError(f"Cannot identify PQ KV layer: {name}")
             layer = int(match.group(1))
-            if (not 0 <= layer < num_layers or layer in layers or cache.dtype != torch.bfloat16 or
-                    cache.ndim != 5 or list(cache.shape[2:]) != [block_size, kv_heads, head_dim] or
-                    (cache.shape[0] != 2 and cache.shape[1] != 2)):
-                raise RuntimeError(f"Unsupported/duplicate PQ KV layer/layout: {name}")
-            paged = cache if cache.shape[1] == 2 else cache.transpose(0, 1)
+            if not 0 <= layer < num_layers or layer in layers:
+                raise RuntimeError(f"Invalid or duplicate PQ KV layer: {name}")
+            paged = page_major(cache, block_size, kv_heads, head_dim)
             if max(ids) >= paged.shape[0]:
                 raise RuntimeError("PQ source GPU page is out of range")
             physical = torch.tensor(ids, dtype=torch.long, device=cache.device)

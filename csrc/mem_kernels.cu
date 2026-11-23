@@ -36,11 +36,18 @@ __host__ __device__ __forceinline__ bool is_mla(
 }
 
 // inline helper to check HND layout (callable from device and host)
-__host__ __device__ __forceinline__ bool is_hnd(
+__host__ __device__ __forceinline__ constexpr bool is_hnd(
     const GPUKVFormat gpu_kv_format) {
   return gpu_kv_format ==
              GPUKVFormat::NL_X_TWO_NB_NH_BS_HS ||             // flash attn HND
-         gpu_kv_format == GPUKVFormat::NL_X_NB_TWO_NH_BS_HS;  // flash infer HND
+         gpu_kv_format == GPUKVFormat::NL_X_NB_TWO_NH_BS_HS ||
+         gpu_kv_format == GPUKVFormat::NL_X_NB_NH_BS_2HS;
+}
+
+__host__ __device__ __forceinline__ constexpr bool is_packed_kv(
+    const GPUKVFormat gpu_kv_format) {
+  return gpu_kv_format == GPUKVFormat::NL_X_NB_BS_NH_2HS ||
+         gpu_kv_format == GPUKVFormat::NL_X_NB_NH_BS_2HS;
 }
 
 // All paged (non-MLA) formats rely on block_size for offset computation.
@@ -51,10 +58,11 @@ inline void check_block_size(const GPUKVFormat gpu_kv_format,
               static_cast<int>(gpu_kv_format));
 }
 
-// HND formats additionally need head_size to decompose scalar offsets.
+// HND and packed formats need head_size to decompose scalar offsets.
 inline void check_head_size(const GPUKVFormat gpu_kv_format,
                             const int head_size) {
-  TORCH_CHECK(!is_hnd(gpu_kv_format) || head_size > 0,
+  TORCH_CHECK((!is_hnd(gpu_kv_format) && !is_packed_kv(gpu_kv_format)) ||
+                  head_size > 0,
               "head_size is required (must be > 0) for GPUKVFormat ",
               static_cast<int>(gpu_kv_format));
 }
@@ -156,8 +164,8 @@ __global__ void single_layer_kv_transfer_kernel(
     const int head_size_in_64bit, const int block_size,
     const TransferDirection direction) {
   constexpr bool USE_MLA = (format == GPUKVFormat::NL_X_NB_BS_HS);
-  constexpr bool HND_LAYOUT = (format == GPUKVFormat::NL_X_TWO_NB_NH_BS_HS ||
-                               format == GPUKVFormat::NL_X_NB_TWO_NH_BS_HS);
+  constexpr bool HND_LAYOUT = is_hnd(format);
+  const int head_stride = head_size_in_64bit * (is_packed_kv(format) ? 2 : 1);
 
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
@@ -180,14 +188,14 @@ __global__ void single_layer_kv_transfer_kernel(
     if constexpr (HND_LAYOUT) {
       // HND layout: [..., num_heads, block_size, head_size]
       vllm_key_idx = block_idx * vllm_block_key_stride_in_64bit +
-                     head_idx * block_size * head_size_in_64bit +
-                     block_offset * head_size_in_64bit + head_offset;
+                     head_idx * block_size * head_stride +
+                     block_offset * head_stride + head_offset;
     } else {
       // NHD layout: [..., block_size, num_heads, head_size]
       // (also correct for MLA where num_heads==1)
       vllm_key_idx = block_idx * vllm_block_key_stride_in_64bit +
-                     block_offset * num_heads * head_size_in_64bit +
-                     head_idx * head_size_in_64bit + head_offset;
+                     block_offset * num_heads * head_stride +
+                     head_idx * head_stride + head_offset;
     }
 
     if (direction == TransferDirection::D2H) {
@@ -290,6 +298,18 @@ __device__ __forceinline__ int64_t page_buffer_offset(
            k_or_v * num_heads * block_size * head_size +
            head_idx * block_size * head_size + block_offset * head_size +
            head_offset;
+  }
+  else if constexpr (is_packed_kv(format)) {
+    const int64_t head_idx = scalar_offset / head_size;
+    const int64_t head_offset = scalar_offset % head_size;
+    int64_t cell = int64_t(token_idx) * scalars_per_token + head_idx * head_size;
+    if constexpr (is_hnd(format)) {
+      const int64_t block_idx = token_idx / block_size;
+      const int block_offset = token_idx % block_size;
+      cell = block_idx * block_size * scalars_per_token +
+             (head_idx * block_size + block_offset) * head_size;
+    }
+    return 2 * cell + k_or_v * head_size + head_offset;
   }
 }
 
@@ -546,6 +566,9 @@ void multi_layer_kv_transfer_templated(
   // to match scalars_per_token (num_xwords) which is also in xword units.
   int head_size_xword = head_size > 0 ? head_size / elements_per_xword : 0;
 
+  TORCH_CHECK(!lmc::is_packed_kv(gpu_kv_format) ||
+                  head_size % elements_per_xword == 0,
+              "Packed vLLM KV head must align with the transfer word width");
   lmc::check_block_size(gpu_kv_format, block_size);
   lmc::check_head_size(gpu_kv_format, head_size_xword);
 
@@ -580,6 +603,12 @@ void multi_layer_kv_transfer_templated(
       case GPUKVFormat::NL_X_NB_TWO_NH_BS_HS:
         LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_NB_TWO_NH_BS_HS);
         break;
+      case GPUKVFormat::NL_X_NB_BS_NH_2HS:
+        LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_NB_BS_NH_2HS);
+        break;
+      case GPUKVFormat::NL_X_NB_NH_BS_2HS:
+        LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_NB_NH_BS_2HS);
+        break;
       default:
         throw std::runtime_error("Unsupported GPUKVFormat");
     }
@@ -605,6 +634,12 @@ void multi_layer_kv_transfer_templated(
         break;
       case GPUKVFormat::NL_X_NB_TWO_NH_BS_HS:
         LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_NB_TWO_NH_BS_HS);
+        break;
+      case GPUKVFormat::NL_X_NB_BS_NH_2HS:
+        LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_NB_BS_NH_2HS);
+        break;
+      case GPUKVFormat::NL_X_NB_NH_BS_2HS:
+        LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_NB_NH_BS_2HS);
         break;
       default:
         throw std::runtime_error("Unsupported GPUKVFormat");
@@ -782,8 +817,16 @@ void single_layer_kv_transfer(
 
   const bool use_mla = lmc::is_mla(gpu_kv_format);
   const bool hnd_layout = lmc::is_hnd(gpu_kv_format);
+  const bool packed_kv = lmc::is_packed_kv(gpu_kv_format);
 
-  if (use_mla) {
+  if (packed_kv) {
+    num_heads = vllm_key_value_cache.size(1);
+    block_size = vllm_key_value_cache.size(2);
+    TORCH_CHECK(vllm_key_value_cache.size(3) % (2 * elements_per_entry) == 0,
+                "Packed vLLM KV head must align with the transfer word width");
+    head_size_in_64bit =
+        vllm_key_value_cache.size(3) / (2 * elements_per_entry);
+  } else if (use_mla) {
     // MLA format: [num_blocks, block_size, head_size]
     num_heads = 1;
     block_size = vllm_key_value_cache.size(1);
@@ -819,7 +862,11 @@ void single_layer_kv_transfer(
 
   int vllm_block_key_stride_in_64bit;
   int vllm_value_offset;
-  if (use_mla) {
+  if (packed_kv) {
+    vllm_block_key_stride_in_64bit =
+        vllm_key_value_cache.stride(0) / elements_per_entry;
+    vllm_value_offset = head_size_in_64bit;
+  } else if (use_mla) {
     // MLA format: [num_blocks, block_size, head_size]
     vllm_block_key_stride_in_64bit =
         vllm_key_value_cache.stride(0) / elements_per_entry;
@@ -865,6 +912,10 @@ void single_layer_kv_transfer(
       LAUNCH_SINGLE_LAYER_KERNEL(GPUKVFormat::NL_X_TWO_NB_NH_BS_HS)
     case GPUKVFormat::NL_X_NB_TWO_NH_BS_HS:
       LAUNCH_SINGLE_LAYER_KERNEL(GPUKVFormat::NL_X_NB_TWO_NH_BS_HS)
+    case GPUKVFormat::NL_X_NB_BS_NH_2HS:
+      LAUNCH_SINGLE_LAYER_KERNEL(GPUKVFormat::NL_X_NB_BS_NH_2HS)
+    case GPUKVFormat::NL_X_NB_NH_BS_2HS:
+      LAUNCH_SINGLE_LAYER_KERNEL(GPUKVFormat::NL_X_NB_NH_BS_2HS)
     default:
       TORCH_CHECK(false,
                   "Unsupported GPUKVFormat for single_layer_kv_transfer: ",

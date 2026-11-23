@@ -10,6 +10,7 @@ import time
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorWorkerMetadata
 from vllm.logger import init_logger
 
+from lmcache.integration.vllm.aissd_page_access import page_major
 from lmcache.integration.vllm.resident_cache import LayerLRU, layer_read_layout, wait_for_archive
 
 logger = init_logger(__name__)
@@ -305,19 +306,26 @@ class ResidentConnectorMixin:
             raise RuntimeError("Unexpected AISSD staged prefill attention metadata")
         try:
             if current["plan"]:
-                if cache.ndim != 5 or cache.shape[1] != 2:
-                    raise RuntimeError("AISSD staged FlashAttention requires a blocks-first KV cache")
                 stager = self._resident_prefill_stager
                 stager.stage(current["backend"], current["plan"], layer_id, cache,
                              current["local_pages"], local_tokens=total - state["prefix_tokens"],
                              restore_tokens=state["external_tail_tokens"])
-                cache = stager.paged_view(total, pages_first=True)
+                staged_pages = stager.paged_view(total, pages_first=True)
+                # The SSD archive has separate K/V planes. FA can consume both
+                # as page views without repacking the whole staged prefix.
+                if cache.ndim == 4:
+                    cache = staged_pages.unbind(1)
+                elif cache.shape[1] == 2:
+                    cache = staged_pages
+                else:
+                    cache = staged_pages.transpose(0, 1)
                 attn_metadata = copy(attn_metadata)
                 attn_metadata.block_table = current["table"]
                 attn_metadata.max_seq_len = total
-                attn_metadata.use_cascade = False
                 attn_metadata.scheduler_metadata = None
-                attn_metadata.prefix_scheduler_metadata = None
+                if hasattr(attn_metadata, "use_cascade"):
+                    attn_metadata.use_cascade = False
+                    attn_metadata.prefix_scheduler_metadata = None
                 attn_metadata.max_num_splits = 0
             result = attention(layer, query, key, value, cache, attn_metadata, output=output)
             if current["plan"] and self._resident_prefill_prefetch:
@@ -399,14 +407,12 @@ class ResidentConnectorMixin:
         tail = source.get("recomputed_tail")
         if tail is None:
             return {}
-        import torch
         token = int(tail["token_index"])
         if token != int(source["prefix_tokens"]) - 1:
             raise RuntimeError("Invalid recomputed resident tail boundary")
         block = int(tail["block_id"])
         offset = token % self._block_size
         snapshots = {}
-        expected_shape = [self._block_size, self._sparse_num_kv_heads, self._sparse_head_size]
         for name, cache in self.kv_caches.items():
             match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", str(name))
             if match is None:
@@ -414,11 +420,9 @@ class ResidentConnectorMixin:
             layer = int(match.group(1))
             if not 0 <= layer < self.num_layers or layer in snapshots:
                 raise RuntimeError("Duplicate or out-of-range resident KV layer")
-            if (cache.dtype != torch.bfloat16 or cache.ndim != 5
-                or list(cache.shape[2:]) != expected_shape
-                or (cache.shape[0] != 2 and cache.shape[1] != 2)):
-                raise ValueError("Unsupported recomputed resident tail KV layout")
-            paged = cache if cache.shape[1] == 2 else cache.transpose(0, 1)
+            paged = page_major(
+                cache, self._block_size, self._sparse_num_kv_heads, self._sparse_head_size
+            )
             if not 0 < block < paged.shape[0]:
                 raise RuntimeError("Recomputed resident tail GPU page is out of range")
             # Copy directly to CPU, without retaining any GPU page/view or
@@ -441,7 +445,9 @@ class ResidentConnectorMixin:
         if layer not in snapshots or len(block_ids) != self._lmcache_chunk_size // self._block_size:
             raise RuntimeError("Recomputed resident tail refill is incomplete")
         page, offset = divmod(token % self._lmcache_chunk_size, self._block_size)
-        paged = kv_cache if kv_cache.shape[1] == 2 else kv_cache.transpose(0, 1)
+        paged = page_major(
+            kv_cache, self._block_size, self._sparse_num_kv_heads, self._sparse_head_size
+        )
         # Apply on every SSD miss, including after eviction or pool shrink.
         # Publish LRU validity only after both the raw read and this update.
         paged[block_ids[page], :, offset].copy_(snapshots[layer], non_blocking=False)
@@ -682,21 +688,9 @@ class ResidentConnectorMixin:
         import torch
         chunk = self._lmcache_chunk_size
         hidden = self._sparse_num_kv_heads * self._sparse_head_size
-        tail = [self._block_size, self._sparse_num_kv_heads, self._sparse_head_size]
-        if (kv_cache.dtype != torch.bfloat16 or kv_cache.ndim != 5
-            or list(kv_cache.shape[2:]) != tail
-            or (kv_cache.shape[0] != 2 and kv_cache.shape[1] != 2)):
-            raise ValueError(
-                "Unsupported resident GPU KV cache geometry: "
-                f"shape={tuple(kv_cache.shape)} dtype={kv_cache.dtype} "
-                f"stride={tuple(kv_cache.stride())}; expected BF16 "
-                f"[blocks, 2, {tail[0]}, {tail[1]}, {tail[2]}] or "
-                f"[2, blocks, {tail[0]}, {tail[1]}, {tail[2]}]"
-            )
-        # The current vLLM backend supplies [blocks, 2, BS, H, D]. Older
-        # K/V-first tensors are accepted through a view, without copying the
-        # preallocated KV pool. Prefer the native blocks-first convention.
-        paged_cache = kv_cache if kv_cache.shape[1] == 2 else kv_cache.transpose(0, 1)
+        paged_cache = page_major(
+            kv_cache, self._block_size, self._sparse_num_kv_heads, self._sparse_head_size
+        )
         k_offset, v_offset, size = layer_read_layout(manifest, layer, self.num_layers, chunk, hidden)
         if self._resident_scratch is None:
             self._resident_scratch = torch.empty((2, chunk, hidden), dtype=torch.bfloat16, device=kv_cache.device)

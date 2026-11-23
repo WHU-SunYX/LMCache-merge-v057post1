@@ -92,6 +92,11 @@ enum class GPUKVFormat : int {
   - TRT-LLM cross-layer (HND layout)
   physical shape: [num_blocks, num_layers, 2, num_heads, block_size, head_size]
   */
+
+  // vLLM packed K/V: the tensor view is [NB, NH, BS, 2 * HS].
+  // Physical orders:
+  NL_X_NB_BS_NH_2HS = 9,  // [NB, BS, NH, 2 * HS] per layer
+  NL_X_NB_NH_BS_2HS = 10, // [NB, NH, BS, 2 * HS] per layer
 };
 
 void multi_layer_kv_transfer(

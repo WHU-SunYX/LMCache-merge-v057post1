@@ -6,12 +6,25 @@ operation materializes a contiguous copy of the paged cache.
 """
 
 from operator import index
+from typing import TYPE_CHECKING
 
-
-def page_major(cache, block_size, heads, head_dim):
-    """Return the logical [page, K/V, token, head, dim] view used by Part1."""
+if TYPE_CHECKING:
+    # Third Party
     import torch
 
+
+def page_major(
+    cache: "torch.Tensor", block_size: int, heads: int, head_dim: int
+) -> "torch.Tensor":
+    """Return a [page, K/V, token, head, dim] view of a BF16 cache."""
+    import torch
+
+    if (
+        cache.ndim == 4
+        and tuple(cache.shape[1:]) == (heads, block_size, 2 * head_dim)
+        and cache.dtype == torch.bfloat16
+    ):
+        return cache.unflatten(-1, (2, head_dim)).permute(0, 3, 2, 1, 4)
     if (cache.ndim != 5 or tuple(cache.shape[2:]) != (block_size, heads, head_dim)
             or cache.dtype != torch.bfloat16
             or (cache.shape[1] != 2 and cache.shape[0] != 2)):

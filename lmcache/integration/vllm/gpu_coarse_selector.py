@@ -15,6 +15,8 @@ import os
 from pathlib import Path
 import re
 
+from lmcache.integration.vllm.aissd_page_access import page_major
+
 logger = logging.getLogger(__name__)
 SCHEMA = "aissd-gpu-coarse-v1"
 ALGORITHM = "segment_minmax_qk_max"
@@ -207,13 +209,9 @@ def build_summary(kv_caches, block_ids, prefix_tokens, chunk_size, block_size,
             if match is None:
                 raise RuntimeError(f"Cannot identify GPU coarse KV layer: {name}")
             layer = int(match.group(1))
-            expected = [block_size, kv_heads, head_dim]
-            if (not 0 <= layer < num_layers or layer in layers or
-                    cache.dtype != torch.bfloat16 or cache.ndim != 5 or
-                    list(cache.shape[2:]) != expected or
-                    (cache.shape[0] != 2 and cache.shape[1] != 2)):
-                raise RuntimeError(f"Unsupported/duplicate GPU coarse KV layer/layout: {name}")
-            paged = cache if cache.shape[1] == 2 else cache.transpose(0, 1)
+            if not 0 <= layer < num_layers or layer in layers:
+                raise RuntimeError(f"Invalid or duplicate GPU coarse KV layer: {name}")
+            paged = page_major(cache, block_size, kv_heads, head_dim)
             if max(block_ids) >= paged.shape[0]:
                 raise RuntimeError("GPU coarse source page is out of range")
             page_indices = torch.tensor(block_ids, dtype=torch.long, device=cache.device)

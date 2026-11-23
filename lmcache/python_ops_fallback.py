@@ -279,6 +279,8 @@ class GPUKVFormat(IntEnum):
 
     # used by: TRT-LLM cross-layer (HND layout)
     NB_NL_TWO_NH_BS_HS = 8
+    NL_X_NB_BS_NH_2HS = 9
+    NL_X_NB_NH_BS_2HS = 10
 
 
 class PageBufferShapeDesc:
@@ -515,6 +517,12 @@ def multi_layer_kv_transfer(
     Fully vectorized Python fallback for multi_layer_kv_transfer.
     Eliminates ALL token- and KV-level Python loops.
     """
+    if gpu_kv_format in (
+        GPUKVFormat.NL_X_NB_BS_NH_2HS,
+        GPUKVFormat.NL_X_NB_NH_BS_2HS,
+    ):
+        raise NotImplementedError("Packed vLLM KV transfer requires native LMCache CUDA ops")
+
     if not isinstance(key_value_ptrs, (torch.Tensor, list)):
         raise TypeError(
             f"Expected torch.Tensor or list, but got {type(key_value_ptrs).__name__}"
@@ -748,6 +756,12 @@ def single_layer_kv_transfer(
         H2D = LMCache  -> vLLM GPU
         D2H = vLLM GPU -> LMCache
     """
+    if gpu_kv_format in (
+        GPUKVFormat.NL_X_NB_BS_NH_2HS,
+        GPUKVFormat.NL_X_NB_NH_BS_2HS,
+    ):
+        raise NotImplementedError("Packed vLLM KV transfer requires native LMCache CUDA ops")
+
     kv_device = lmc_key_value_cache.device
     paged_memory_device = vllm_key_value_cache.device
     slots_kv = slot_mapping.to(dtype=torch.long).to(kv_device)

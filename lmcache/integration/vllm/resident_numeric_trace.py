@@ -28,6 +28,7 @@ def before_attention(context, layer_id, query, kv_cache):
     if not root or not context.get("host_sparse_decode_ready", False):
         return None
     import torch
+    from lmcache.integration.vllm.aissd_page_access import page_major
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Resident numeric tracing requires eager attention")
     if int(context.get("host_active_reqs", 0)) != 1:
@@ -66,12 +67,11 @@ def before_attention(context, layer_id, query, kv_cache):
     remote_tokens = sum(ch["token_end"] - ch["token_start"] for ch in selected)
     if remote_tokens + local_tokens != seq_len:
         raise RuntimeError("Numeric trace: selected/local lengths disagree with FA")
-    if kv_cache.ndim != 5:
-        raise RuntimeError("Numeric trace requires a five-dimensional paged KV cache")
-    paged = kv_cache if kv_cache.shape[1] == 2 else kv_cache.transpose(0, 1)
-    if paged.shape[1] != 2 or any(int(b) <= 0 for b in physical):
+    block_size = int(context["block_size"])
+    heads = kv_cache.shape[1 if kv_cache.ndim == 4 else 3]
+    paged = page_major(kv_cache, block_size, heads, query.shape[-1])
+    if any(int(b) <= 0 for b in physical):
         raise RuntimeError("Numeric trace: invalid KV layout or null physical page")
-    block_size = int(paged.shape[2])
     if block_count != (seq_len + block_size - 1) // block_size:
         raise RuntimeError("Numeric trace: invalid compact FA block count")
     indices = torch.tensor(physical, dtype=torch.long, device=kv_cache.device)
