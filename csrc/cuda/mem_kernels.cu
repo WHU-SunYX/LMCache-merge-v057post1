@@ -6,6 +6,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
+#include <numeric>
 #ifdef USE_ROCM
   #include <hip/hip_fp8.h>
 #else
@@ -28,22 +29,6 @@
 
 namespace lmc {
 
-// inline helper to check HND layout (callable from device and host)
-__host__ __device__ __forceinline__ constexpr bool is_hnd(
-    const EngineKVFormat engine_kv_format) {
-  return engine_kv_format ==
-             EngineKVFormat::NL_X_TWO_NB_NH_BS_HS ||  // flash attn HND
-         engine_kv_format ==
-             EngineKVFormat::NL_X_NB_TWO_NH_BS_HS ||
-         gpu_kv_format == GPUKVFormat::NL_X_NB_NH_BS_2HS;
-}
-
-__host__ __device__ __forceinline__ constexpr bool is_packed_kv(
-    const GPUKVFormat gpu_kv_format) {
-  return gpu_kv_format == GPUKVFormat::NL_X_NB_BS_NH_2HS ||
-         gpu_kv_format == GPUKVFormat::NL_X_NB_NH_BS_2HS;
-}
-
 // All paged (non-MLA) formats rely on block_size for offset computation.
 // The blocked-scale indexer format is MLA-like for kv_size but its paged
 // addressing is per-block, so it needs block_size too.
@@ -56,11 +41,10 @@ inline void check_block_size(const EngineKVFormat engine_kv_format,
               static_cast<int>(engine_kv_format));
 }
 
-// HND and packed formats need head_size to decompose scalar offsets.
+// HND formats additionally need head_size to decompose scalar offsets.
 inline void check_head_size(const EngineKVFormat engine_kv_format,
                             const int head_size) {
-  TORCH_CHECK((!is_hnd(engine_kv_format) && !is_packed_kv(gpu_kv_format)) ||
-                  head_size > 0,
+  TORCH_CHECK(!format_facts(engine_kv_format).is_hnd || head_size > 0,
               "head_size is required (must be > 0) for EngineKVFormat ",
               static_cast<int>(engine_kv_format));
 }
@@ -162,8 +146,9 @@ __global__ void single_layer_kv_transfer_kernel(
     const int head_size_in_64bit, const int block_size,
     const TransferDirection direction) {
   constexpr bool USE_MLA = (format == EngineKVFormat::NL_X_NB_BS_HS);
-  constexpr bool HND_LAYOUT = (format == EngineKVFormat::NL_X_TWO_NB_NH_BS_HS ||
-                               format == EngineKVFormat::NL_X_NB_TWO_NH_BS_HS);
+  constexpr bool HND_LAYOUT = format_facts(format).is_hnd;
+  constexpr bool PACKED = is_fused_packed(format);
+  const int head_stride = head_size_in_64bit * (PACKED ? 2 : 1);
 
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
@@ -186,14 +171,14 @@ __global__ void single_layer_kv_transfer_kernel(
     if constexpr (HND_LAYOUT) {
       // HND layout: [..., num_heads, block_size, head_size]
       vllm_key_idx = block_idx * vllm_block_key_stride_in_64bit +
-                     head_idx * block_size * head_size_in_64bit +
-                     block_offset * head_size_in_64bit + head_offset;
+                     head_idx * block_size * head_stride +
+                     block_offset * head_stride + head_offset;
     } else {
       // NHD layout: [..., block_size, num_heads, head_size]
       // (also correct for MLA where num_heads==1)
       vllm_key_idx = block_idx * vllm_block_key_stride_in_64bit +
-                     block_offset * num_heads * head_size_in_64bit +
-                     head_idx * head_size_in_64bit + head_offset;
+                     block_offset * num_heads * head_stride +
+                     head_idx * head_stride + head_offset;
     }
 
     if (direction == TransferDirection::D2H) {
@@ -223,7 +208,8 @@ __device__ __forceinline__ int64_t
 page_buffer_offset(const int k_or_v, const int token_idx,
                    const int scalar_offset, const int scalars_per_token,
                    const int page_buffer_size, const int block_size,
-                   const int head_size, const int64_t block_stride_xwords) {
+                   const int head_size, const int64_t block_stride_xwords,
+                   const bool split_packed_kv = false) {
   /*
   logical semantics of arguments (agnostic to physical format):
   k_or_v:            0 for key, 1 for value
@@ -233,11 +219,10 @@ page_buffer_offset(const int k_or_v, const int token_idx,
   scalars_per_token: NH * HS in xword units — total data elements per token slot
   page_buffer_size:  NB * BS — total token slots in the paged buffer
   block_size:        BS — number of token slots per block
-  head_size:         HS in xword units — only used by HND formats to decompose
-  scalar_offset into (head_idx, head_offset)
-  block_stride_xwords: physical per-block step (xword units) — only used by
-  blocks-first cross-layer formats, whose block step spans every layer's
-  bytes (and, in HMA-shared pools, other groups' bytes too)
+  head_size:         one K or V head in xword units, used for HND and
+  split packed K/V transfers
+  block_stride_xwords: physical per-block step (xword units) for packed layouts
+  split_packed_kv: LMCache stores two planes while vLLM packs K/V per head
 
   The job of page_buffer_offset is to translate these logical arguments into a
   physical address based on the EngineKVFormat.
@@ -300,33 +285,35 @@ page_buffer_offset(const int k_or_v, const int token_idx,
            k_or_v * num_heads * block_size * head_size +
            head_idx * block_size * head_size + block_offset * head_size +
            head_offset;
-  } else if constexpr (format == EngineKVFormat::NL_X_NB_NH_BS_TWO_HS ||
-                       format == EngineKVFormat::NL_X_NB_NH_BS_CS) {
-    const int hs2 = 2 * head_size;  // packed K+V width per head (xword units)
-    const int block_idx = token_idx / block_size;
+  } else if constexpr (is_fused_packed(format)) {
+    const int64_t block_idx = token_idx / block_size;
     const int block_offset = token_idx % block_size;
-    const int head_idx = scalar_offset / hs2;
-    const int head_offset = scalar_offset % hs2;
-    const int num_heads = scalars_per_token / hs2;
-    // vLLM blocks-first pools pass the real per-block step; 0 means tight.
+    const int packed_head_size = 2 * head_size;
+    const int packed_token_width =
+        split_packed_kv ? 2 * scalars_per_token : scalars_per_token;
+    // Split LMCache rows contain one plane. Insert the K/V sub-axis at
+    // each head's boundary in the engine's packed row.
+    const int packed_scalar_offset =
+        split_packed_kv
+            ? (scalar_offset / head_size) * packed_head_size +
+                  k_or_v * head_size + scalar_offset % head_size
+            : scalar_offset;
     const int64_t block_step =
         block_stride_xwords > 0
             ? block_stride_xwords
-            : static_cast<int64_t>(num_heads) * block_size * hs2;
-    return block_idx * block_step + head_idx * block_size * hs2 +
-           block_offset * hs2 + head_offset;
-  } else if constexpr (format == EngineKVFormat::NL_X_NB_BS_NH_TWO_HS ||
-                       format == EngineKVFormat::NL_X_NB_BS_NH_CS) {
-    const int block_idx = token_idx / block_size;
-    const int block_offset = token_idx % block_size;
-    // vLLM blocks-first pools pass the real per-block step; 0 means tight.
-    const int64_t block_step =
-        block_stride_xwords > 0
-            ? block_stride_xwords
-            : static_cast<int64_t>(block_size) * scalars_per_token;
-    return block_idx * block_step +
-           static_cast<int64_t>(block_offset) * scalars_per_token +
-           scalar_offset;
+            : static_cast<int64_t>(block_size) * packed_token_width;
+    if constexpr (format_facts(format).is_hnd) {
+      const int head_idx = packed_scalar_offset / packed_head_size;
+      const int head_offset = packed_scalar_offset % packed_head_size;
+      return block_idx * block_step +
+             (static_cast<int64_t>(head_idx) * block_size + block_offset) *
+                 packed_head_size +
+             head_offset;
+    } else {
+      return block_idx * block_step +
+             static_cast<int64_t>(block_offset) * packed_token_width +
+             packed_scalar_offset;
+    }
   }
   // DSA indexer: page [BSxvals][BSxscales]; 4B units, so scale == 1 unit
   else if constexpr (format == EngineKVFormat::NL_X_NB_BSV_BSS) {
@@ -458,7 +445,7 @@ __global__ void load_and_reshape_multi_layer_kernel(
 
     const int64_t vllm_offset = page_buffer_offset<format>(
         k_or_v, slot_idx, i, scalars_per_token, page_buffer_size, block_size,
-        head_size, block_stride_xwords);
+        head_size, block_stride_xwords, gridDim.z == 2);
 
     if (DIRECTION)  // 1 is paged buffer to LMCache
       key_value[lmcache_offset] = paged_buffer_ptr[vllm_offset];
@@ -552,9 +539,6 @@ void multi_layer_kv_transfer_templated(
   // to match scalars_per_token (num_xwords) which is also in xword units.
   int head_size_xword = head_size > 0 ? head_size / elements_per_xword : 0;
 
-  TORCH_CHECK(!lmc::is_packed_kv(gpu_kv_format) ||
-                  head_size % elements_per_xword == 0,
-              "Packed vLLM KV head must align with the transfer word width");
   lmc::check_block_size(engine_kv_format, block_size);
   lmc::check_head_size(engine_kv_format, head_size_xword);
   // 0 means tight; the per-format offset entries compute their own tight step.
@@ -564,11 +548,14 @@ void multi_layer_kv_transfer_templated(
       "NL_X_NB_BSV_BSS requires 4-byte transfer units (row bytes "
       "must be divisible by 4 and not by 8)");
 
-  // Fused packs K+V in the trailing dim (kv_size == 1, like MLA): single pass.
-  int k_or_v_size =
-      (::is_mla(engine_kv_format) || ::is_fused_packed(engine_kv_format)) ? 1
-                                                                          : 2;
-
+  // Packed engine pages can be transferred as a fused row or split into
+  // independent K and V planes according to the LMCache buffer shape.
+  const int k_or_v_size = ::is_fused_packed(engine_kv_format)
+                             ? key_value.size(0)
+                             : (::is_mla(engine_kv_format) ? 1 : 2);
+  if (num_transfer_tokens == 0) {
+    return;
+  }
   dim3 grid(num_transfer_tokens, num_layers, k_or_v_size);
   dim3 block(std::min(num_xwords, 128));
 
@@ -619,12 +606,6 @@ void multi_layer_kv_transfer_templated(
       case EngineKVFormat::NL_X_NB_BSV_BSS:
         LAUNCH_KERNEL_WITH_FORMAT(T, false, EngineKVFormat::NL_X_NB_BSV_BSS);
         break;
-      case GPUKVFormat::NL_X_NB_BS_NH_2HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_NB_BS_NH_2HS);
-        break;
-      case GPUKVFormat::NL_X_NB_NH_BS_2HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_NB_NH_BS_2HS);
-        break;
       default:
         throw std::runtime_error("Unsupported EngineKVFormat");
     }
@@ -671,12 +652,6 @@ void multi_layer_kv_transfer_templated(
         break;
       case EngineKVFormat::NL_X_NB_BSV_BSS:
         LAUNCH_KERNEL_WITH_FORMAT(T, true, EngineKVFormat::NL_X_NB_BSV_BSS);
-        break;
-      case GPUKVFormat::NL_X_NB_BS_NH_2HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_NB_BS_NH_2HS);
-        break;
-      case GPUKVFormat::NL_X_NB_NH_BS_2HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_NB_NH_BS_2HS);
         break;
       default:
         throw std::runtime_error("Unsupported EngineKVFormat");
@@ -848,8 +823,26 @@ void multi_layer_kv_transfer(
     const EngineKVFormat engine_kv_format, const int block_size,
     const int head_size, const int skip_prefix_n_tokens,
     const int64_t block_stride_elems) {
-  int num_origin_elements = key_value.size(3);
-  int copy_size = num_origin_elements * key_value.element_size();
+  const int64_t element_size = key_value.element_size();
+  int64_t copy_size = key_value.size(3) * element_size;
+  if (::is_fused_packed(engine_kv_format)) {
+    const int64_t planes = key_value.size(0);
+    TORCH_CHECK(planes == 1 || planes == 2,
+                "Packed vLLM transfer expects one fused or two split planes");
+    if (planes == 2 || format_facts(engine_kv_format).is_hnd) {
+      TORCH_CHECK(head_size > 0,
+                  "Packed vLLM transfer requires a positive per-plane head size");
+      const int64_t head_elements = head_size * (2 / planes);
+      TORCH_CHECK(key_value.size(3) % head_elements == 0,
+                  "Packed vLLM transfer buffer width must align with its heads");
+      // Select a word width that fits inside each copied head, so a split
+      // transfer can never straddle the K/V boundary even for short heads.
+      copy_size = head_size * element_size;
+    }
+    if (block_stride_elems > 0) {
+      copy_size = std::gcd(copy_size, block_stride_elems * element_size);
+    }
+  }
 #ifndef LAUNCH_MULTI_LAYER_KV_TRANSFER
   #define LAUNCH_MULTI_LAYER_KV_TRANSFER(type)                          \
     do {                                                                \
@@ -927,16 +920,22 @@ void single_layer_kv_transfer(
   int block_size;
 
   const bool use_mla = ::is_mla(engine_kv_format);
-  const bool hnd_layout = lmc::is_hnd(engine_kv_format);
-  const bool packed_kv = lmc::is_packed_kv(gpu_kv_format);
+  const bool hnd_layout = format_facts(engine_kv_format).is_hnd;
+  const bool packed_kv = ::is_fused_packed(engine_kv_format);
 
   if (packed_kv) {
-    num_heads = vllm_key_value_cache.size(1);
-    block_size = vllm_key_value_cache.size(2);
-    TORCH_CHECK(vllm_key_value_cache.size(3) % (2 * elements_per_entry) == 0,
-                "Packed vLLM KV head must align with the transfer word width");
-    head_size_in_64bit =
-        vllm_key_value_cache.size(3) / (2 * elements_per_entry);
+    // The deprecated TWO_HS registrations expose an explicit axis of size 2.
+    const int rank = vllm_key_value_cache.dim();
+    TORCH_CHECK(rank == 4 || (rank == 5 && vllm_key_value_cache.size(3) == 2),
+                "Expected a packed vLLM K/V cache");
+    num_heads = vllm_key_value_cache.size(hnd_layout ? 1 : 2);
+    block_size = vllm_key_value_cache.size(hnd_layout ? 2 : 1);
+    const int packed_width = rank == 4 ? vllm_key_value_cache.size(3)
+                                       : 2 * vllm_key_value_cache.size(4);
+    TORCH_CHECK(packed_width % (2 * elements_per_entry) == 0 &&
+                    vllm_key_value_cache.stride(0) % elements_per_entry == 0,
+                "Packed vLLM heads and page stride must align to 64 bits");
+    head_size_in_64bit = packed_width / (2 * elements_per_entry);
   } else if (use_mla) {
     // MLA format: [num_blocks, block_size, head_size]
     num_heads = 1;
@@ -1023,10 +1022,14 @@ void single_layer_kv_transfer(
       LAUNCH_SINGLE_LAYER_KERNEL(EngineKVFormat::NL_X_TWO_NB_NH_BS_HS)
     case EngineKVFormat::NL_X_NB_TWO_NH_BS_HS:
       LAUNCH_SINGLE_LAYER_KERNEL(EngineKVFormat::NL_X_NB_TWO_NH_BS_HS)
-    case GPUKVFormat::NL_X_NB_BS_NH_2HS:
-      LAUNCH_SINGLE_LAYER_KERNEL(GPUKVFormat::NL_X_NB_BS_NH_2HS)
-    case GPUKVFormat::NL_X_NB_NH_BS_2HS:
-      LAUNCH_SINGLE_LAYER_KERNEL(GPUKVFormat::NL_X_NB_NH_BS_2HS)
+    case EngineKVFormat::NL_X_NB_BS_NH_CS:
+      LAUNCH_SINGLE_LAYER_KERNEL(EngineKVFormat::NL_X_NB_BS_NH_CS)
+    case EngineKVFormat::NL_X_NB_NH_BS_CS:
+      LAUNCH_SINGLE_LAYER_KERNEL(EngineKVFormat::NL_X_NB_NH_BS_CS)
+    case EngineKVFormat::NL_X_NB_BS_NH_TWO_HS:
+      LAUNCH_SINGLE_LAYER_KERNEL(EngineKVFormat::NL_X_NB_BS_NH_TWO_HS)
+    case EngineKVFormat::NL_X_NB_NH_BS_TWO_HS:
+      LAUNCH_SINGLE_LAYER_KERNEL(EngineKVFormat::NL_X_NB_NH_BS_TWO_HS)
     default:
       TORCH_CHECK(false,
                   "Unsupported EngineKVFormat for single_layer_kv_transfer: ",

@@ -8,6 +8,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.gpu_connector.kv_format.specs import get_spec_class
 
 if TYPE_CHECKING:
     # First Party
@@ -85,24 +86,25 @@ class LMCacheMetadata:
         return [self.kv_dtype]
 
     def get_shapes(self, num_tokens: Optional[int] = None) -> list[torch.Size]:
-        """Get the shapes of the KV cache in LMCache"""
+        """Get in-process archive shapes, with separate K/V planes for MHA."""
         if num_tokens is None:
             num_tokens = self.chunk_size
         klg_manager = self.kv_layer_groups_manager
         if klg_manager is not None and klg_manager.kernel_groups:
-            # Read kv_size from each group's shape_desc rather than self.use_mla
-            # so heterogeneous groups (should any ever co-exist) are handled.
-            return [
-                torch.Size(
-                    [
-                        group.shape_desc.kv_size,
-                        group.num_layers,
-                        num_tokens,
-                        group.hidden_dim_size,
-                    ]
+            shapes = []
+            for group in klg_manager.kernel_groups:
+                kv_size = group.shape_desc.kv_size
+                hidden_dim = group.hidden_dim_size
+                fmt = group.engine_kv_format
+                if fmt is not None and get_spec_class(fmt).is_fused_packed:
+                    # Packed addresses describe the engine buffer. Keep the
+                    # archive in KV_2LTD so the GDS reader can access either plane.
+                    kv_size = 2
+                    hidden_dim //= 2
+                shapes.append(
+                    torch.Size([kv_size, group.num_layers, num_tokens, hidden_dim])
                 )
-                for group in klg_manager.kernel_groups
-            ]
+            return shapes
         return [
             torch.Size(
                 [

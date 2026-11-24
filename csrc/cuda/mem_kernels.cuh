@@ -8,6 +8,8 @@
 #include <c10/util/Exception.h>
 #include "kv_transfer_types.h"
 
+// Packed engine pages support one fused LMCache plane or separate K/V
+// planes in key_value. head_size is the width of one K or V head.
 void multi_layer_kv_transfer(
     torch::Tensor& key_value, const torch::Tensor& key_value_ptrs,
     const torch::Tensor& slot_mapping, const torch::Device& paged_memory_device,

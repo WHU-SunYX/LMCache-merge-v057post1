@@ -21,6 +21,7 @@ from lmcache.v1.gpu_connector.kv_format.types import KVLayoutName
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.inprocess.v1.config import LMCacheEngineConfig
     from lmcache.v1.gpu_connector.utils import LayoutHints
 
 logger = init_logger(__name__)
@@ -33,21 +34,22 @@ def is_false(value: str) -> bool:
 
 
 def vllm_layout_hints(vllm_config: "VllmConfig | None" = None) -> "LayoutHints":
-    """Build layout_hints dict by querying vLLM at runtime."""
+    """Return the physical KV layout hint used by vLLM format detection."""
     hints: LayoutHints = {}
-    cache_config = getattr(vllm_config, "cache_config", None)
-    if hasattr(cache_config, "get_resolved_kv_cache_layout"):
-        layout_name = cache_config.get_resolved_kv_cache_layout().name
-        hints["vllm_packed_layout"] = layout_name
-        if layout_name == "LBNHC":
-            hints["kv_layout"] = "NHD"
-        elif layout_name == "LBHNC":
-            hints["kv_layout"] = "HND"
-        return hints
     kv_layout = try_get_vllm_kv_cache_layout(vllm_config)
     if kv_layout is not None:
         hints["kv_layout"] = kv_layout
     return hints
+
+
+def lmcache_get_or_create_config() -> "LMCacheEngineConfig":
+    """Return the in-process config singleton for older vLLM callers."""
+    # First Party
+    from lmcache.inprocess.integration.vllm.utils import (
+        lmcache_get_or_create_config as get_config,
+    )
+
+    return get_config()
 
 
 def translate_vllm_kv_cache_layout(kv_cache_layout: str) -> KVLayoutName:

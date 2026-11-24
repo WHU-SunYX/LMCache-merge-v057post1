@@ -336,8 +336,8 @@ LMC_KV_FORMAT_HD constexpr bool is_mla(EngineKVFormat f) {
   return format_facts(f).is_mla;
 }
 
-// vLLM fused K/V: K and V packed in the trailing dim (2 * head_size), no
-// separate K/V axis — transferred as one k_or_v == 0 pass (like MLA).
+// vLLM fused K/V: the engine packs K and V in the trailing dim (2 * head_size).
+// The in-process transfer can split them into two planes in the archive.
 LMC_KV_FORMAT_HD constexpr bool is_fused_packed(EngineKVFormat f) {
   return format_facts(f).is_fused_packed;
 }

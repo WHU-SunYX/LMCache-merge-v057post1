@@ -442,11 +442,12 @@ def assert_is_vllm_mla_or_flash_attn_or_flash_infer(
         - ``NL_X_TWO_NB_NH_BS_HS`` (flash attention, HND)
         - ``NL_X_NB_TWO_NH_BS_HS`` (flash infer, HND)
         - ``NL_X_NB_BS_HS`` (MLA)
+        - Packed K/V formats (NHD or HND)
 
     Raises:
         AssertionError: If *engine_kv_format* is not one of the accepted formats.
     """
-    assert engine_kv_format in (
+    assert get_spec_class(engine_kv_format).is_fused_packed or engine_kv_format in (
         lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
         lmcache_native.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS,
         lmcache_native.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,

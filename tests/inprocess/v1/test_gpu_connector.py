@@ -18,7 +18,9 @@ from lmcache.inprocess.v1.gpu_connector.gpu_connectors import (
     VLLMPagedMemLayerwiseGPUConnector,
 )
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
-from lmcache.v1.gpu_connector.utils import get_dtype
+from lmcache.utils import EngineType
+from lmcache.v1.gpu_connector.utils import get_dtype, normalize_kv_and_discover_format
+from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.memory_allocators.gpu_memory_allocator import GPUMemoryAllocator
 from lmcache.v1.memory_allocators.paged_tensor_memory_allocator import (
     PagedTensorMemoryAllocator,
@@ -96,6 +98,74 @@ def patch_pin_allocator():
         ),
     ):
         yield
+
+
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+def test_packed_v3_archive_keeps_separate_planes_per_group(kv_layout: str) -> None:
+    """In-process archives keep the KV_2LTD layout for packed engine groups."""
+    blocks, heads, block_size = 4, 2, 4
+    device = torch.device("cuda:0")
+    head_sizes = (8, 16)
+    slots = torch.tensor([1, 6, 11], device=device)
+    count = slots.numel()
+    layout_hints = {"kv_layout": kv_layout}
+    # Logical vLLM registration is [blocks, heads, tokens, packed width].
+    caches = []
+    for head_size in head_sizes:
+        shape = (
+            (blocks, heads, block_size, 2 * head_size)
+            if kv_layout == "HND"
+            else (blocks, block_size, heads, 2 * head_size)
+        )
+        cache = torch.arange(
+            blocks * heads * block_size * 2 * head_size,
+            dtype=torch.float32,
+            device=device,
+        ).reshape(shape)
+        caches.append(cache if kv_layout == "HND" else cache.transpose(1, 2))
+
+    fmt, normalized = normalize_kv_and_discover_format(
+        caches, EngineType.VLLM, layout_hints
+    )
+    metadata = LMCacheMetadata(
+        model_name="packed-test",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.float32,
+        kv_shape=(2, 2, count, heads, head_sizes[0]),
+        chunk_size=count,
+        kv_layer_groups_manager=KVLayerGroupsManager(
+            normalized, engine_kv_formats=[fmt, fmt]
+        ),
+    )
+    shapes = metadata.get_shapes(count)
+    assert shapes == [torch.Size((2, 1, count, heads * width)) for width in head_sizes]
+    allocator = GPUMemoryAllocator(64 * 1024, device=device)
+    archive = allocator.allocate(shapes, metadata.get_dtypes(), MemoryFormat.KV_2LTD)
+    assert archive is not None
+    writer = VLLMPagedMemGPUConnectorV3.from_metadata(
+        metadata, use_gpu=True, device=device, layout_hints=layout_hints
+    )
+    writer.from_gpu(archive, 0, count, kvcaches=caches, slot_mapping=slots)
+    torch_dev.synchronize()
+
+    positions = (slots // block_size, slice(None), slots % block_size)
+    for i, (cache, width) in enumerate(zip(caches, head_sizes, strict=True)):
+        expected = cache[positions].reshape(count, heads, 2, width)
+        expected = expected.permute(2, 0, 1, 3).reshape(shapes[i])
+        assert torch.equal(archive.get_tensor(i), expected)
+
+    restored = [torch.zeros_like(cache) for cache in caches]
+    reader = VLLMPagedMemGPUConnectorV3.from_metadata(
+        metadata, device=device, layout_hints=layout_hints
+    )
+    reader.to_gpu(archive, 0, count, kvcaches=restored, slot_mapping=slots)
+    torch_dev.synchronize()
+    for cache, output in zip(caches, restored, strict=True):
+        assert torch.equal(output[positions], cache[positions])
+    archive.ref_count_down()
 
 
 @pytest.mark.parametrize("use_gpu", [True, False])

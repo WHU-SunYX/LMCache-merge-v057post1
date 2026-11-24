@@ -45,6 +45,8 @@ def multi_layer_kv_transfer(
         )
 
     format_spec = _format_spec(engine_kv_format)
+    if format_spec.is_fused_packed:
+        raise NotImplementedError("Packed vLLM K/V transfer requires native CUDA ops")
 
     # TODO: Implement head_size support for HND layouts as next step.
     if format_spec.is_hnd:
@@ -201,6 +203,8 @@ def single_layer_kv_transfer(
     valid_slots = slots_kv[valid_mask_kv].to(paged_memory_device)
 
     format_spec = _format_spec(engine_kv_format)
+    if format_spec.is_fused_packed:
+        raise NotImplementedError("Packed vLLM K/V transfer requires native CUDA ops")
     is_mla = format_spec.is_mla
 
     if is_mla:
