@@ -586,6 +586,7 @@ class GdsBackend(AllocatorBackendInterface):
             "aissd_qkpack_log", "AISSD_QKPACK_LOG", True
         )
         self._aissd_qkpack_abi: dict[str, Any] | None = None
+        self._aissd_qkpack_tp_size = getattr(metadata, "aissd_sparse_kv_tp_size", 1)
         self._aissd_qkpack_executor: ThreadPoolExecutor | None = None
         self._aissd_qkpack_tasks: set[asyncio.Future] = set()
         self._aissd_qkpack_stats_lock = threading.Lock()
@@ -1093,6 +1094,197 @@ class GdsBackend(AllocatorBackendInterface):
                 float(snapshot.get("total_ms", 0.0)),
             )
 
+    @staticmethod
+    def _tp_qkpack_source_identity(stat: os.stat_result) -> tuple[int, ...]:
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+    def _read_tp_qkpack_k(
+        self,
+        path: str,
+        stat: os.stat_result,
+        layer: int,
+        expected_shape: tuple[int, int, int, int],
+    ) -> np.ndarray:
+        _, num_layers, chunk_size, rank_width = expected_shape
+        layer_bytes = chunk_size * rank_width * 2
+        with open(path, "rb") as shard:
+            shape, dtype, size, fmt, _ = unpack_metadata(
+                shard.read(_METADATA_MAX_SIZE)
+            )
+            if (
+                tuple(shape) != expected_shape
+                or dtype != torch.bfloat16
+                or fmt != MemoryFormat.KV_2LTD
+                or size != 2 * num_layers * layer_bytes
+                or stat.st_size != _METADATA_MAX_SIZE + size
+            ):
+                raise RuntimeError(f"Unexpected SSD Sparse KV TP shard layout: {path}")
+            shard.seek(_METADATA_MAX_SIZE + layer * layer_bytes)
+            raw_k = shard.read(layer_bytes)
+            if len(raw_k) != layer_bytes or (
+                self._tp_qkpack_source_identity(os.fstat(shard.fileno()))
+                != self._tp_qkpack_source_identity(stat)
+            ):
+                raise RuntimeError(f"SSD Sparse KV TP shard changed: {path}")
+        # Each BF16 value occupies the high 16 bits of its FP32 representation.
+        bits = np.frombuffer(raw_k, dtype="<u2").astype(np.uint32)
+        return (bits << 16).view(np.float32).reshape(chunk_size, rank_width)
+
+    def prepare_tp_qkpack_sidecar(
+        self,
+        key: CacheEngineKey,
+        source_path: str,
+        *,
+        layer: int,
+        bucket: int,
+        num_q_heads: int,
+        kv_shape: tuple[int, int, int, int],
+    ) -> str:
+        """Pack one layer's K from the committed GDS shards in TP rank order."""
+        tp_size = self._aissd_qkpack_tp_size
+        abi = self._aissd_qkpack_abi
+        if abi is None or not self._aissd_qkpack_immutable_source_kv:
+            raise RuntimeError(
+                "SSD Sparse KV TP requires QKPack prepack and immutable GDS KV"
+            )
+        if (
+            tp_size <= 1
+            or key.world_size != tp_size
+            or key.worker_id != 0
+            or len(self.gds_paths) != 1
+        ):
+            raise RuntimeError(
+                "SSD Sparse KV TP expects a rank 0 cache key and one GDS path"
+            )
+
+        num_layers, chunk_size, num_kv_heads, head_dim = kv_shape
+        if bucket != int(abi.get("reference_bucket", 128)):
+            bucket_config = (abi.get("buckets") or {}).get(str(bucket), {})
+            if not isinstance(bucket_config.get("packed_k_chunk_abi"), dict):
+                raise RuntimeError(f"SSD Sparse KV TP ABI lacks packed K for c{bucket}")
+        bucket_abi = self._qkpack_bucket_abi(abi, bucket)
+        row_bytes = num_kv_heads * head_dim * 2
+        data_offset = int(bucket_abi.get("data_offset", _METADATA_MAX_SIZE))
+        payload_bytes = chunk_size * row_bytes
+        if (
+            not 0 <= layer < num_layers
+            or num_kv_heads % tp_size
+            or int(abi.get("num_q_heads", 0)) != num_q_heads
+            or int(abi.get("num_layers", 0)) != num_layers
+            or int(bucket_abi["chunk_size"]) != chunk_size
+            or int(bucket_abi["num_kv_heads"]) != num_kv_heads
+            or int(bucket_abi["head_dim"]) != head_dim
+            or int(bucket_abi["row_stride_bytes"]) != row_bytes
+            or int(bucket_abi["chunk_bytes"]) != payload_bytes
+            or data_offset != _METADATA_MAX_SIZE
+            or bucket_abi.get("layout", "token_major_hkv_dim")
+            != "token_major_hkv_dim"
+        ):
+            raise RuntimeError("SSD Sparse KV TP model or bucket differs from the ABI")
+        scale = float(bucket_abi["scale"])
+        zero_point = int(bucket_abi.get("zero_point", 0))
+        if not np.isfinite(scale) or scale <= 0 or not -32768 <= zero_point <= 32767:
+            raise RuntimeError("Invalid QKPack quantization parameters for SSD KV TP")
+
+        paths = [
+            self._key_to_path(key.with_new_worker_id(rank))[0]
+            for rank in range(tp_size)
+        ]
+        if os.path.abspath(paths[0]) != os.path.abspath(source_path):
+            raise RuntimeError("SSD Sparse KV TP rank 0 shard differs from the manifest")
+        stats = []
+        for rank, path in enumerate(paths):
+            try:
+                os.stat(path + _METADATA_FILE_SUFFIX)
+                stats.append(os.stat(path))
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    f"Missing SSD Sparse KV TP shard for rank {rank}: {path}"
+                ) from exc
+        if any(stat.st_dev != stats[0].st_dev for stat in stats):
+            raise RuntimeError("SSD Sparse KV TP shards must share one GDS filesystem")
+
+        sources = tuple(self._tp_qkpack_source_identity(stat) for stat in stats)
+        # Include every shard generation and the ABI so a stale sidecar cannot
+        # be selected after a rank's archive changes.
+        sidecar_inputs = (
+            paths, sources, self._aissd_qkpack_abi_identity, layer, bucket
+        )
+        identity = hashlib.sha256(repr(sidecar_inputs).encode("utf-8")).hexdigest()
+        filename = f"aissd-qkpack-tp{tp_size}-{identity}.int16.v1"
+        sidecar = os.path.join(os.path.dirname(source_path), filename)
+        source = stats[0]
+        if os.path.exists(sidecar):
+            valid, reason = self._qkpack_sidecar_validation(
+                sidecar,
+                data_offset=data_offset,
+                payload_bytes=payload_bytes,
+                bucket=bucket,
+                layer=layer,
+                source_file=source_path,
+                source_file_size=source.st_size,
+                source_mtime_ns=source.st_mtime_ns,
+                source_device=source.st_dev,
+                source_inode=source.st_ino,
+                expected_model_profile=self._aissd_qkpack_model_profile,
+                expected_num_layers=num_layers,
+                expected_num_q_heads=num_q_heads,
+                expected_abi_identity=self._aissd_qkpack_abi_identity,
+            )
+            if not valid:
+                raise RuntimeError(f"Invalid QKPack TP sidecar {sidecar}: {reason}")
+            return sidecar
+
+        rank_width = num_kv_heads // tp_size * head_dim
+        shard_shape = (2, num_layers, chunk_size, rank_width)
+        full_k = np.empty((chunk_size, num_kv_heads * head_dim), dtype=np.float32)
+        for rank, (path, stat) in enumerate(zip(paths, stats, strict=True)):
+            start = rank * rank_width
+            full_k[:, start : start + rank_width] = self._read_tp_qkpack_k(
+                path, stat, layer, shard_shape
+            )
+        payload = self._qkpack_make_payload(
+            torch.from_numpy(full_k), scale, zero_point, row_bytes
+        )
+        header = {
+            "magic": "AISSDQKPACK",
+            "schema_version": int(abi.get("schema_version", 1)),
+            "abi_path": self._aissd_qkpack_abi_path,
+            "abi_identity_sha256": self._aissd_qkpack_abi_identity,
+            "model_profile": self._aissd_qkpack_model_profile,
+            "num_layers": num_layers,
+            "num_q_heads": num_q_heads,
+            "q_per_kv": num_q_heads // num_kv_heads,
+            "layer_id": layer,
+            "bucket": bucket,
+            "chunk_size": chunk_size,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "hkv_dim": num_kv_heads * head_dim,
+            "source_dtype": "bf16",
+            "packed_dtype": "int16",
+            "layout": "token_major_hkv_dim",
+            "shape_per_chunk": list(full_k.shape),
+            "row_stride_bytes": row_bytes,
+            "packed_offset": data_offset,
+            "packed_bytes": payload_bytes,
+            "quant_type": bucket_abi.get("quant_type", "symmetric_int16"),
+            "scale": scale,
+            "zero_point": zero_point,
+            "source_file": source_path,
+            "source_file_size": source.st_size,
+            "source_mtime_ns": source.st_mtime_ns,
+            "source_device": source.st_dev,
+            "source_inode": source.st_ino,
+            "tp_size": tp_size,
+            "tp_source_identity": identity,
+            "payload_crc32": f"0x{binascii.crc32(payload):08x}",
+        }
+        self._qkpack_write_sidecar_atomic(
+            sidecar, header, payload, data_offset, self._aissd_qkpack_fsync
+        )
+        return sidecar
+
     def _maybe_write_aissd_qkpack_sidecars(
         self,
         path: str,
@@ -1120,6 +1312,17 @@ class GdsBackend(AllocatorBackendInterface):
                 with open(self._aissd_qkpack_abi_path, "r", encoding="utf-8") as f:
                     abi = json.load(f)
                 self._aissd_qkpack_abi = abi
+            if (
+                getattr(self, "_aissd_qkpack_tp_size", 1) > 1
+                and fmt == MemoryFormat.KV_2LTD
+                and kv_chunk.ndim == 4
+                and kv_chunk.shape[1] == int(abi.get("num_layers") or 0)
+                and kv_chunk.shape[-1] * self._aissd_qkpack_tp_size
+                == int(abi.get("num_kv_heads") or 0) * int(abi.get("head_dim") or 0)
+            ):
+                # A rank-local archive cannot produce a full-head sidecar.
+                # Rank 0 packs the committed shards when it prepares selection.
+                return
             buckets = self._aissd_qkpack_buckets or [int(abi.get("reference_bucket", 128))]
             layers = self._aissd_qkpack_layers or [0]
             try:

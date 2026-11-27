@@ -72,6 +72,8 @@ class LMCacheMetadata:
     engine_id: Optional[str] = None
     """ extra config from kv_connector (e.g., lmcache_rpc_port) """
     kv_connector_extra_config: Optional[dict] = None
+    """Size of the validated SSD Sparse KV TP group on in-process workers."""
+    aissd_sparse_kv_tp_size: int = 1
 
     def is_first_rank(self) -> bool:
         """Check if the current worker is the first rank"""

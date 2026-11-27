@@ -22,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.parallel_state import (
     get_pp_group,
+    get_tp_group,
 )
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -987,9 +988,6 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
                     config,
                 )
 
-        # Legacy compatibility check
-        self._check_legacy_register_kv_caches()
-
         self.kv_caches: dict[str, torch.Tensor] = {}
         self._block_size = vllm_config.cache_config.block_size
         self.load_specs: dict[str, LoadSpec] = {}
@@ -1088,6 +1086,8 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
         )
         if self.sparse_kv_spec.sparse_kv_backend not in ("host", "ssd-cpu", "ssd-npu"):
             raise ValueError(f"Unsupported lmcache.sparse_kv_backend={self.sparse_kv_spec.sparse_kv_backend!r}")
+        self._init_aissd_tp(vllm_config, config, role)
+        self._check_legacy_register_kv_caches()
         if self.sparse_kv_spec.enabled:
             logger.info("LMCache sparse KV enabled: %s", self.sparse_kv_spec)
             if (
@@ -1196,6 +1196,136 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
             except Exception:
                 logger.exception("[sparse-kv-step] failed to preallocate persistent sparse context")
                 raise
+
+    def _init_aissd_tp(
+        self,
+        vllm_config: "VllmConfig",
+        config: LMCacheEngineConfig,
+        role: KVConnectorRole,
+    ) -> None:
+        self._aissd_tp_size = 1
+        self._aissd_tp_rank = 0
+        spec = self.sparse_kv_spec
+        parallel = vllm_config.parallel_config
+        tp_size = parallel.tensor_parallel_size
+        if (
+            tp_size == 1
+            or not spec.enabled
+            or spec.sparse_kv_backend not in ("ssd-cpu", "ssd-npu")
+        ):
+            return
+
+        scheduler = vllm_config.scheduler_config
+        if (
+            parallel.world_size != tp_size
+            or parallel.data_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+            or vllm_config.speculative_config is not None
+            or scheduler.async_scheduling
+            or scheduler.max_num_seqs != 1
+        ):
+            raise ValueError(
+                "SSD Sparse KV TP expects one TP group, max_num_seqs=1, "
+                "and synchronous scheduling without context parallelism "
+                "or speculative decoding"
+            )
+        if (
+            not spec.enable_sparse_attention
+            or spec.granularity != "chunk"
+            or spec.top_n_chunks <= 0
+            or self.kv_role != "kv_both"
+            or vllm_config.cache_config.enable_prefix_caching
+            or not self._block_size
+            or self._lmcache_chunk_size % self._block_size
+            or _aissd_sparse_prefill_policy() != "full_load"
+        ):
+            raise ValueError(
+                "SSD Sparse KV TP requires chunk selection and sparse attention, "
+                "kv_role=kv_both, prefix caching disabled, full_load suffix "
+                "prefill, and chunk_size divisible by block_size"
+            )
+        if (
+            self._aissd_layer_reuse_enabled()
+            or os.environ.get("AISSD_TOKEN_REUSE_STRATEGY", "none").strip().lower()
+            != "none"
+            or _env_flag("AISSD_TOKEN_REUSE_Q_DRIFT_SHADOW")
+            or self._aissd_sparse_extra("aissd_gpu_resident_tokens", 0)
+            not in (0, "0")
+            or _env_flag("AISSD_SELECTOR_QUALITY_TRACE")
+            or _env_flag("AISSD_QK_CALIB_DUMP")
+        ):
+            raise ValueError(
+                "SSD Sparse KV TP requires layer/token reuse, GPU residency, "
+                "selector quality tracing, and QK calibration to be disabled"
+            )
+        if (
+            not vllm_config.model_config.enforce_eager
+            and (
+                _env_flag("AISSD_SPARSE_KV_ALLOW_CUDAGRAPH")
+                or not _env_flag("AISSD_SPARSE_KV_STEP_EAGER", "1")
+            )
+        ):
+            raise ValueError("SSD Sparse KV TP selection must execute in eager mode")
+        if os.environ.get("VLLM_SPARSE_ATTENTION_IMPL", "fa_varlen").lower() not in (
+            "fa_varlen", "flash", "flash_attn", "flashattention"
+        ):
+            raise ValueError("SSD Sparse KV TP requires the fa_varlen attention path")
+
+        qkpack, _, fallback, _ = self._aissd_qkpack_sidecar_policy()
+        if (
+            not config.gds_path
+            or "," in config.gds_path
+            or config.use_layerwise
+            or config.enable_blending
+            or config.enable_async_loading
+            or config.get_extra_config_value("save_only_first_rank", False)
+            or set(config.get_lookup_server_worker_ids(False, tp_size))
+            != set(range(tp_size))
+            or not qkpack
+            or fallback not in ("error", "fail")
+            or not self._aissd_sparse_bool(
+                "aissd_qkpack_prepack", "AISSD_QKPACK_PREPACK"
+            )
+        ):
+            raise ValueError(
+                "SSD Sparse KV TP requires one GDS path, synchronous "
+                "non-layerwise loads, lookup/save on all ranks, "
+                "and QKPack sidecars with fallback=error"
+            )
+        model = vllm_config.model_config
+        full_q_heads = model.get_num_attention_heads(parallel) * tp_size
+        if (
+            self._sparse_num_kv_heads <= 0
+            or self._sparse_num_kv_heads * tp_size != model.get_total_num_kv_heads()
+            or self._sparse_head_size <= 0
+        ):
+            raise ValueError("SSD Sparse KV TP requires non-replicated KV heads")
+        self._aissd_tp_size = tp_size
+        self._aissd_tp_num_q_heads = full_q_heads
+        if role == KVConnectorRole.WORKER:
+            tp = get_tp_group()
+            if tp.world_size != tp_size or tp.rank_in_group != parallel.rank:
+                raise ValueError("SSD Sparse KV TP ranks must match LMCache worker IDs")
+            engine = self.lmcache_engine
+            if (
+                engine is None
+                or engine.metadata.use_mla
+                or engine.metadata.kv_dtype != torch.bfloat16
+            ):
+                raise ValueError("SSD Sparse KV TP requires a standard BF16 KV archive")
+            engine.metadata.aissd_sparse_kv_tp_size = tp_size
+            self._aissd_tp_rank = tp.rank_in_group
+            logger.info(
+                "[aissd-tp] rank=%d tp_size=%d q_heads=%d kv_heads=%d "
+                "local_kv_heads=%d head_dim=%d",
+                self._aissd_tp_rank,
+                tp_size,
+                full_q_heads,
+                self._sparse_num_kv_heads * tp_size,
+                self._sparse_num_kv_heads,
+                self._sparse_head_size,
+            )
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -1368,6 +1498,47 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
 
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        if getattr(self, "_aissd_tp_size", 1) == 1:
+            self._start_load_kv(forward_context, **kwargs)
+            return
+
+        # All ranks must agree that the step may enter the layer collectives.
+        # Publish a leader-side preparation error before followers run forward.
+        status = None
+        error = None
+        try:
+            engine = self.lmcache_engine
+            if engine is None or not engine.is_healthy():
+                raise RuntimeError("LMCache engine is unavailable or unhealthy")
+            self._start_load_kv(forward_context, **kwargs)
+            ctx = self._sparse_current_step_context or {}
+            status = (
+                tuple(ctx.get("req_ids", ())),
+                ctx.get("host_sparse_decode_ready", False),
+                ctx.get("host_local_tokens", 0),
+                ctx.get("aissd_tp_prefix_tokens", 0),
+            )
+        except Exception as exc:
+            logger.exception("SSD Sparse KV TP step preparation failed")
+            error = str(exc)
+
+        tp = get_tp_group()
+        peers = [None] * tp.world_size
+        with torch.inference_mode(False):
+            torch.distributed.all_gather_object(
+                peers, (status, error), group=tp.cpu_group
+            )
+        for rank, (peer, error) in enumerate(peers):
+            if error is not None:
+                raise RuntimeError(
+                    f"SSD Sparse KV TP prepare failed on rank {rank}: {error}"
+                )
+            if peer != peers[0][0]:
+                raise RuntimeError(
+                    f"SSD Sparse KV TP ranks disagree on step metadata: {peers}"
+                )
+
+    def _start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
         paged KV buffer.
 
@@ -2557,6 +2728,8 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
         """
         enabled, allowed_buckets, fallback, default_layer = self._aissd_qkpack_sidecar_policy()
         layer = int(default_layer if layer_id is None else layer_id)
+        tp_size = getattr(self, "_aissd_tp_size", 1)
+        tp_gds = None
         if not enabled or not chunks:
             return chunks, "raw", 0
         # In coarse ON mode descriptors cover the entire searchable prefix,
@@ -2569,21 +2742,59 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
         if selector_candidate_count is not None and bucket not in allowed_buckets:
             raise RuntimeError(f"GPU coarse requires enabled sidecar bucket c{bucket}")
         if bucket not in allowed_buckets:
+            if tp_size > 1:
+                raise RuntimeError(f"SSD Sparse KV TP requires QKPack bucket c{bucket}")
             return chunks, f"raw_bucket_c{bucket}_disabled", bucket
+        if tp_size > 1:
+            # First Party
+            from lmcache.inprocess.v1.storage_backend.gds_backend import GdsBackend
+
+            engine = self.lmcache_engine
+            assert engine is not None and engine.storage_manager is not None
+            backends = engine.storage_manager.get_active_storage_backends(
+                location=GdsBackend.__name__
+            )
+            tp_gds = next(
+                (backend for _, backend in backends if isinstance(backend, GdsBackend)),
+                None,
+            )
+            if tp_gds is None:
+                raise RuntimeError("SSD Sparse KV TP requires an active GDS backend")
         sidecar_suffix = f"..aissd_qkpack.l{layer}.c{bucket}.int16.v1"
         rewritten: list[dict[str, Any]] = []
         missing: list[str] = []
         invalid: list[str] = []
         chunk_size = int(self._lmcache_chunk_size)
-        expected_hidden = int(getattr(self, "_sparse_num_kv_heads", 0) or 0) * int(
-            getattr(self, "_sparse_head_size", 0) or 0
-        )
+        num_kv_heads = int(getattr(self, "_sparse_num_kv_heads", 0) or 0) * tp_size
+        head_size = int(getattr(self, "_sparse_head_size", 0) or 0)
+        expected_hidden = num_kv_heads * head_size
         expected_payload_bytes = (
             int(chunk_size) * int(expected_hidden) * 2 if expected_hidden > 0 else 0
         )
         for ch in chunks:
             src_path = str(ch.get("path") or "")
             sidecar = src_path + sidecar_suffix
+            if tp_gds is not None:
+                key = utils.parse_cache_key(ch["key"])
+                start = int(ch["token_start"])
+                if (
+                    ch["backend"] != "GdsBackend"
+                    or not isinstance(key, utils.CacheEngineKey)
+                    or start < 0
+                    or start % chunk_size
+                    or int(ch["token_end"]) != start + chunk_size
+                ):
+                    raise RuntimeError(
+                        "SSD Sparse KV TP candidates must be full aligned GDS chunks"
+                    )
+                sidecar = tp_gds.prepare_tp_qkpack_sidecar(
+                    key,
+                    src_path,
+                    layer=layer,
+                    bucket=bucket,
+                    num_q_heads=self._aissd_tp_num_q_heads,
+                    kv_shape=(self.num_layers, chunk_size, num_kv_heads, head_size),
+                )
             if not src_path or not os.path.exists(sidecar):
                 missing.append(sidecar)
                 continue
@@ -2648,8 +2859,6 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
             new_ch["nbytes"] = payload_bytes
             new_ch["dtype"] = "torch.int16"
             new_ch["fmt"] = "K_ONLY_THD"
-            num_kv_heads = int(getattr(self, "_sparse_num_kv_heads", 0) or 0)
-            head_size = int(getattr(self, "_sparse_head_size", 0) or 0)
             if num_kv_heads > 0 and head_size > 0 and num_kv_heads * head_size == hidden:
                 new_ch["shape"] = [chunk_size, num_kv_heads, head_size]
             else:
@@ -4112,6 +4321,20 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
             backend_name = str(getattr(spec, "sparse_kv_backend", "host"))
             step_context["aissd_selector_backend"] = backend_name
             if backend_name in ("ssd-cpu", "ssd-npu"):
+                tp_size = getattr(self, "_aissd_tp_size", 1)
+                tp_rank = getattr(self, "_aissd_tp_rank", 0)
+                if tp_size > 1:
+                    prefix_tokens = lmcache_cached[0]
+                    if len(req_ids) != 1 or prefix_tokens % self._lmcache_chunk_size:
+                        raise RuntimeError(
+                            "SSD Sparse KV TP requires one request with a "
+                            "chunk-aligned external prefix"
+                        )
+                    step_context.update(
+                        aissd_tp_size=tp_size,
+                        aissd_tp_rank=tp_rank,
+                        aissd_tp_prefix_tokens=prefix_tokens,
+                    )
                 blocks_per_chunk = max(1, cdiv(max(1, int(self._lmcache_chunk_size)), max(1, int(self._block_size))))
                 # Keep the persistent AISSD candidate tensor capacity stable.
                 # AISSD_SPARSE_KV_NPU_CANDIDATE_CAP controls the real candidate
@@ -4123,12 +4346,14 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
                 max_candidates = max(1, int(os.environ.get("AISSD_SPARSE_KV_CANDIDATE_TENSOR_CAP", "256")))
                 t_candidate0 = time.perf_counter()
                 try:
-                    aissd_tensors = self._build_aissd_candidate_tensors_for_step(
-                        req_ids=req_ids,
-                        runtime_items=runtime_items,
-                        max_candidates=max_candidates,
-                        blocks_per_chunk=blocks_per_chunk,
-                    )
+                    aissd_tensors = {}
+                    if tp_rank == 0:
+                        aissd_tensors = self._build_aissd_candidate_tensors_for_step(
+                            req_ids=req_ids,
+                            runtime_items=runtime_items,
+                            max_candidates=max_candidates,
+                            blocks_per_chunk=blocks_per_chunk,
+                        )
                 except Exception:
                     self._aissd_abort_qkpack_sidecar_fd_build()
                     raise
@@ -4150,8 +4375,11 @@ class LMCacheConnectorV1Impl(ResidentConnectorMixin):
                     )
                 else:
                     step_context["aissd_indexcache_policy_generation"] = -1
-                    step_context["aissd_indexcache_full_layers"] = tuple(
-                        int(x) for x in aissd_tensors.get("aissd_candidate_layer_ids", []).tolist()
+                    candidate_layers = aissd_tensors.get("aissd_candidate_layer_ids")
+                    step_context["aissd_indexcache_full_layers"] = (
+                        tuple(int(x) for x in candidate_layers.tolist())
+                        if candidate_layers is not None
+                        else ()
                     )
                     step_context["aissd_indexcache_source_layers"] = ()
                     step_context["aissd_indexcache_policy_origin"] = "legacy"

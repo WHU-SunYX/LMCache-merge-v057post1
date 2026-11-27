@@ -132,7 +132,14 @@ class BoundedGdsPipeline:
             ("enable_blending", cfg.enable_blending),
             ("local_cpu", cfg.local_cpu),
             ("MLA", engine.metadata.use_mla),
-            ("world_size != 1", engine.metadata.world_size != 1),
+            # The SSD Sparse KV TP adapter validates one group and one
+            # rank-local archive/pool per worker before post_init.
+            (
+                "world_size != 1 outside SSD Sparse KV TP",
+                engine.metadata.world_size != 1
+                and engine.metadata.world_size
+                != getattr(engine.metadata, "aissd_sparse_kv_tp_size", 1),
+            ),
             ("remove_after_retrieve", engine.remove_after_retrieve),
         ):
             if enabled:
